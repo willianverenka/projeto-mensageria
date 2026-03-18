@@ -1,0 +1,69 @@
+version: "3.9"
+
+services:
+  orquestrador:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: orquestrador
+    command: ["python", "broker.py"]
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+
+  servidor_python:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: servidor_python
+    command: ["python", "servidores/python/servidor.py"]
+    environment:
+      - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - DATA_DIR=/data
+    volumes:
+      - ./dados/servidor_python:/data
+    depends_on:
+      - orquestrador
+
+  cliente_python:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: cliente_python
+    command: ["python", "clientes/python/cliente.py"]
+    environment:
+      - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - CLIENTE_NOME=cliente_python
+      - CLIENTE_CANAL=canal_cliente_python
+    depends_on:
+      - orquestrador
+      - servidor_python
+
+  servidor_go:
+    build:
+      context: .
+      dockerfile: Dockerfile.go
+    container_name: servidor_go
+    command: ["/servidor"]
+    environment:
+      - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - DATA_DIR=/data
+    volumes:
+      - ./dados/servidor_go:/data
+    depends_on:
+      - orquestrador
+
+  cliente_go:
+    build:
+      context: .
+      dockerfile: Dockerfile.go
+    container_name: cliente_go
+    command: ["/cliente"]
+    environment:
+      - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - CLIENTE_NOME=cliente_go
+      - CLIENTE_CANAL=canal_go
+    depends_on:
+      - orquestrador
+      - servidor_go
+

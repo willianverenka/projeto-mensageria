@@ -1,0 +1,52 @@
+# Dados de runtime (persistência dos servidores)
+# Ignora somente os arquivos de dados gerados em runtime,
+# permitindo versionar a árvore de pastas em dados/
+dados/**/logins.jsonl
+dados/**/canais.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+
+# IDE 
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ambiente
+.env
+.env.*
+*.pem
+*.key
+
+# Logs e temporários
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Enunciado
+parte1.md
