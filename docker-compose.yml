@@ -67,3 +67,31 @@ services:
       - orquestrador
       - servidor_go
 
+  servidor_java:
+    build:
+      context: .
+      dockerfile: Dockerfile.java
+    container_name: servidor_java
+    command: ["ServidorJava"]
+    environment:
+      - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - DATA_DIR=/data
+    volumes:
+      - ./dados/servidor_java:/data
+    depends_on:
+      - orquestrador
+
+  cliente_java:
+    build:
+      context: .
+      dockerfile: Dockerfile.java
+    container_name: cliente_java
+    command: ["ClienteJava"]
+    environment:
+      - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - CLIENTE_NOME=cliente_java
+      - CLIENTE_CANAL=canal_java
+    depends_on:
+      - orquestrador
+      - servidor_java
+
