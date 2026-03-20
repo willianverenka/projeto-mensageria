@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package chat;
+
+option go_package = "projeto-mensageria/shared/go/protos";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// 1. Tipos comuns 
+// ============================================================================
+
+enum Status {
+  STATUS_SUCESSO = 0;
+  STATUS_ERRO    = 1;
+}
+
+message Cabecalho {
+  int32 id_transacao = 1;
+  string linguagem_origem = 2;
+  google.protobuf.Timestamp timestamp_envio = 3;
+}
+
+// ============================================================================
+// 2. Login de usuário
+// ============================================================================
+
+message LoginRequest {
+  Cabecalho cabecalho = 1;
+  string nome_usuario  = 2;
+}
+
+message LoginResponse {
+  Cabecalho cabecalho = 1;
+  Status   status      = 2; // SUCESSO ou ERRO
+  string   erro_msg    = 3; // preenchido em caso de erro
+}
+
+// ============================================================================
+// 3. Criação de canal
+// ============================================================================
+
+message CreateChannelRequest {
+  Cabecalho cabecalho = 1;
+  string nome_canal    = 2;
+}
+
+message CreateChannelResponse {
+  Cabecalho cabecalho = 1;
+  Status   status      = 2;
+  string   erro_msg    = 3; // ex: "canal já existe", "nome inválido"
+}
+
+// ============================================================================
+// 4. Listagem de canais
+// ============================================================================
+
+message ListChannelsRequest {
+  Cabecalho cabecalho = 1;
+}
+
+message ListChannelsResponse {
+  Cabecalho cabecalho = 1;
+  repeated string canais = 2;
+}
+
+// ============================================================================
+// 5. Envelope unificado para trafegar em ZeroMQ
+// ============================================================================
+
+
+message Envelope {
+  // Cabeçalho comum a todas as mensagens.
+  Cabecalho cabecalho = 1;
+
+  // oneof garante que apenas UM desses campos esteja presente por mensagem.
+  oneof conteudo {
+    // Login
+    LoginRequest  login_req  = 2;
+    LoginResponse login_res  = 3;
+
+    // Criação de canal
+    CreateChannelRequest  create_channel_req = 4;
+    CreateChannelResponse create_channel_res = 5;
+
+    // Listagem de canais
+    ListChannelsRequest  list_channels_req = 6;
+    ListChannelsResponse list_channels_res = 7;
+  }
+}

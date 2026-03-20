@@ -1,0 +1,76 @@
+# Dados de runtime (persistência dos servidores)
+dados/**/logins.jsonl
+dados/**/canais.json
+
+# --- C# / .NET ---
+bin/
+obj/
+# Ignora arquivos gerados pelo MSBuild/dotnet
+*.user
+*.userosscache
+*.sln.doccache
+# Publicação e pacotes
+publish/
+*.nupkg
+# Arquivos de cache do NuGet
+project.lock.json
+project.fragment.lock.json
+
+# --- JetBrains Rider / Visual Studio ---
+.idea/
+*.sln.iml
+*.suo
+*.user
+*.userosscache
+*.sln.doccache
+*.shellbuffer
+# Rider local configs
+.idea/.idea.*/.idea/workspace.xml
+.idea/.idea.*/.idea/shelf/
+.idea/.idea.*/.idea/contentModel.xml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# --- Go ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+
+# --- IDE Geral ---
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Ambiente ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Logs e temporários ---
+*.log
+*.tmp
+*.temp
+*.bak
+
+# --- Documentação ---
+parte1.md

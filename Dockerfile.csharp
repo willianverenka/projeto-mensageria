@@ -1,0 +1,21 @@
+﻿# Estágio de Build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS builder
+WORKDIR /src
+
+COPY . .
+
+RUN dotnet restore "servidores/csharp/Servidor/Servidor.sln"
+
+WORKDIR "/src/servidores/csharp/Servidor"
+RUN dotnet publish "Servidor.csproj" -c Release -o /app/servidor /p:UseAppHost=false
+
+WORKDIR "/src/clientes/csharp/Cliente"
+RUN dotnet publish "Cliente.csproj" -c Release -o /app/cliente /p:UseAppHost=false
+
+FROM mcr.microsoft.com/dotnet/runtime:10.0
+WORKDIR /app
+
+COPY --from=builder /app/servidor ./servidor
+COPY --from=builder /app/cliente ./cliente
+
+ENTRYPOINT ["dotnet", "servidor/Servidor.dll"]

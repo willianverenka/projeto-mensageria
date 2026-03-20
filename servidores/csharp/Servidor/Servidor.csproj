@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <Compile Remove="Shared\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <EmbeddedResource Remove="Shared\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Remove="Shared\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="Shared\Shared.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="NetMQ" Version="4.0.2.2" />
+    </ItemGroup>
+
+</Project>
