@@ -1,10 +1,35 @@
 # Dados de runtime (persistência dos servidores)
-# Ignora somente os arquivos de dados gerados em runtime,
-# permitindo versionar a árvore de pastas em dados/
 dados/**/logins.jsonl
 dados/**/canais.json
 
-# Python
+# --- C# / .NET ---
+bin/
+obj/
+# Ignora arquivos gerados pelo MSBuild/dotnet
+*.user
+*.userosscache
+*.sln.doccache
+# Publicação e pacotes
+publish/
+*.nupkg
+# Arquivos de cache do NuGet
+project.lock.json
+project.fragment.lock.json
+
+# --- JetBrains Rider / Visual Studio ---
+.idea/
+*.sln.iml
+*.suo
+*.user
+*.userosscache
+*.sln.doccache
+*.shellbuffer
+# Rider local configs
+.idea/.idea.*/.idea/workspace.xml
+.idea/.idea.*/.idea/shelf/
+.idea/.idea.*/.idea/contentModel.xml
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.pyo
@@ -18,7 +43,7 @@ dist/
 build/
 .eggs/
 
-# Go
+# --- Go ---
 *.exe
 *.exe~
 *.dll
@@ -26,27 +51,26 @@ build/
 *.dylib
 /bin/
 
-# IDE 
-.idea/
+# --- IDE Geral ---
 *.swp
 *.swo
 *~
 
-# OS
+# --- OS ---
 .DS_Store
 Thumbs.db
 
-# Ambiente
+# --- Ambiente ---
 .env
 .env.*
 *.pem
 *.key
 
-# Logs e temporários
+# --- Logs e temporários ---
 *.log
 *.tmp
 *.temp
 *.bak
 
-# Enunciado
+# --- Documentação ---
 parte1.md

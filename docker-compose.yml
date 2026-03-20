@@ -37,7 +37,7 @@ services:
       - CLIENTE_CANAL=canal_cliente_python
     depends_on:
       - orquestrador
-      - servidor_python
+   #   - servidor_python
 
   servidor_go:
     build:
@@ -94,4 +94,31 @@ services:
     depends_on:
       - orquestrador
       - servidor_java
-
+  servidor_csharp:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.csharp
+    container_name: servidor_csharp
+    environment:
+      - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - DATA_DIR=/data
+    volumes:
+      - ./dados/servidor_csharp:/data
+    depends_on:
+      - orquestrador
+      
+  cliente_csharp:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.csharp
+    container_name: cliente_csharp
+    entrypoint: ["dotnet", "cliente/Cliente.dll"]
+    environment:
+      - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - CLIENTE_NOME=cliente_csharp
+      - CLIENTE_CANAL=canal_csharp
+    depends_on:
+      - orquestrador
+      - servidor_csharp
