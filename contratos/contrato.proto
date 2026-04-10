@@ -65,7 +65,30 @@ message ListChannelsResponse {
 }
 
 // ============================================================================
-// 5. Envelope unificado para trafegar em ZeroMQ
+// 5. Publicacao em canal
+// ============================================================================
+
+message PublishRequest {
+  Cabecalho cabecalho = 1;
+  string canal = 2;
+  string mensagem = 3;
+}
+
+message PublishResponse {
+  Cabecalho cabecalho = 1;
+  Status status = 2;
+  string erro_msg = 3;
+}
+
+message ChannelMessage {
+  string canal = 1;
+  string mensagem = 2;
+  string remetente = 3;
+  google.protobuf.Timestamp timestamp_envio = 4;
+}
+
+// ============================================================================
+// 6. Envelope unificado para trafegar em ZeroMQ
 // ============================================================================
 
 
@@ -86,5 +109,9 @@ message Envelope {
     // Listagem de canais
     ListChannelsRequest  list_channels_req = 6;
     ListChannelsResponse list_channels_res = 7;
+
+    // Publicacao
+    PublishRequest  publish_req = 8;
+    PublishResponse publish_res = 9;
   }
 }

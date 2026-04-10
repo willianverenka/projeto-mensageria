@@ -1,25 +1,31 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"projeto-mensageria/shared/go/mensageria"
 	"projeto-mensageria/shared/go/protos"
 
 	"github.com/pebbe/zmq4"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
 	orqEndpointDefault = "tcp://orquestrador:5555"
-	nomeUsuarioDefault  = "cliente_go"
-	nomeCanalDefault    = "canal_go"
+	proxySubEndpoint   = "tcp://proxy:5558"
+	nomeUsuarioDefault = "cliente_go"
+	nomeCanalDefault   = "canal_go"
 )
 
 func main() {
 	orqEndpoint := getEnv("ORQ_ENDPOINT", orqEndpointDefault)
+	subEndpoint := getEnv("PROXY_SUB_ENDPOINT", proxySubEndpoint)
 	nomeUsuario := getEnv("CLIENTE_NOME", nomeUsuarioDefault)
 	nomeCanal := getEnv("CLIENTE_CANAL", nomeCanalDefault)
 
@@ -34,7 +40,17 @@ func main() {
 	}
 	log.Printf("[CLIENTE] Conectado ao orquestrador em %s", orqEndpoint)
 
-	cliente := &Cliente{sock: sock}
+	subSock, err := zmq4.NewSocket(zmq4.SUB)
+	if err != nil {
+		log.Fatalf("Novo socket SUB: %v", err)
+	}
+	defer subSock.Close()
+	if err := subSock.Connect(subEndpoint); err != nil {
+		log.Fatalf("Conectar SUB ao proxy: %v", err)
+	}
+	log.Printf("[CLIENTE] Conectado ao proxy sub em %s", subEndpoint)
+
+	cliente := &Cliente{sock: sock, subSock: subSock, subscribed: map[string]bool{}}
 
 	for i := 0; i < 3; i++ {
 		if cliente.fazerLogin(nomeUsuario) {
@@ -43,17 +59,36 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	cliente.criarCanal(nomeCanal)
-	cliente.listarCanais()
-
-	for i := 0; i < 100; i++ {
-		cliente.listarCanais()
-		time.Sleep(500 * time.Millisecond)
+	cliente.iniciarReceptor()
+	canais := cliente.listarCanais()
+	if len(canais) < 5 {
+		novoCanal := fmt.Sprintf("%s_%d", nomeCanal, rand.Intn(10000))
+		cliente.criarCanal(novoCanal)
+		canais = cliente.listarCanais()
+	}
+	for len(cliente.subscribed) < 3 && len(cliente.subscribed) < len(canais) {
+		escolhido := canais[rand.Intn(len(canais))]
+		cliente.inscrever(escolhido)
+	}
+	for {
+		canais = cliente.listarCanais()
+		if len(canais) == 0 {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		canal := canais[rand.Intn(len(canais))]
+		for i := 0; i < 10; i++ {
+			_ = cliente.publicar(canal, randomMensagem(12))
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 
 type Cliente struct {
-	sock *zmq4.Socket
+	sock       *zmq4.Socket
+	subSock    *zmq4.Socket
+	subscribed map[string]bool
+	mu         sync.Mutex
 }
 
 func getEnv(name, defaultVal string) string {
@@ -167,4 +202,79 @@ func (c *Cliente) listarCanais() []string {
 		log.Printf("[CLIENTE] Canais existentes: %s", strings.Join(canais, ", "))
 	}
 	return canais
+}
+
+func (c *Cliente) publicar(canal, mensagem string) bool {
+	cab := mensageria.NovoCabecalho(mensageria.OrigemLabel(mensageria.RoleCliente))
+	req := &protos.PublishRequest{Cabecalho: cab, Canal: canal, Mensagem: mensagem}
+	env := &protos.Envelope{
+		Cabecalho: cab,
+		Conteudo:  &protos.Envelope_PublishReq{PublishReq: req},
+	}
+	respEnv, err := c.enviarEAguardar(env)
+	if err != nil {
+		log.Printf("[CLIENTE] Erro ao publicar: %v", err)
+		return false
+	}
+	res, ok := respEnv.GetConteudo().(*protos.Envelope_PublishRes)
+	if !ok {
+		log.Printf("[CLIENTE] Resposta inesperada ao publicar: %T", respEnv.GetConteudo())
+		return false
+	}
+	if res.PublishRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+		log.Printf("[CLIENTE] Falha ao publicar em '%s': %s", canal, res.PublishRes.GetErroMsg())
+		return false
+	}
+	return true
+}
+
+func (c *Cliente) inscrever(canal string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.subscribed[canal] {
+		return
+	}
+	if err := c.subSock.SetSubscribe(canal); err != nil {
+		log.Printf("[CLIENTE] Erro ao inscrever no canal '%s': %v", canal, err)
+		return
+	}
+	c.subscribed[canal] = true
+	log.Printf("[CLIENTE] Inscrito no canal '%s'", canal)
+}
+
+func (c *Cliente) iniciarReceptor() {
+	go func() {
+		for {
+			msg, err := c.subSock.RecvMessageBytes(0)
+			if err != nil || len(msg) < 2 {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			channelMsg := &protos.ChannelMessage{}
+			err = proto.Unmarshal(msg[1], channelMsg)
+			if err != nil {
+				continue
+			}
+			ts := channelMsg.GetTimestampEnvio()
+			now := time.Now()
+			log.Printf(
+				"[CANAL=%s] msg='%s' envio=%d.%09d recebimento=%d.%09d",
+				string(msg[0]),
+				channelMsg.GetMensagem(),
+				ts.GetSeconds(),
+				ts.GetNanos(),
+				now.Unix(),
+				now.Nanosecond(),
+			)
+		}
+	}()
+}
+
+func randomMensagem(n int) string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
 }

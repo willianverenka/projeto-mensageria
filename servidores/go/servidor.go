@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"projeto-mensageria/shared/go/mensageria"
 	"projeto-mensageria/shared/go/protos"
@@ -17,11 +18,13 @@ import (
 
 const (
 	orqEndpointDefault = "tcp://orquestrador:5556"
+	proxyPubEndpoint   = "tcp://proxy:5557"
 	dataDirDefault     = "/data"
 )
 
 func main() {
 	orqEndpoint := getEnv("ORQ_ENDPOINT_SERVIDOR", orqEndpointDefault)
+	pubEndpoint := getEnv("PROXY_PUB_ENDPOINT", proxyPubEndpoint)
 	dataDir := getEnv("DATA_DIR", dataDirDefault)
 
 	sock, err := zmq4.NewSocket(zmq4.DEALER)
@@ -36,27 +39,47 @@ func main() {
 	log.Printf("[SERVIDOR] Conectado ao orquestrador em %s", orqEndpoint)
 
 	server := &Servidor{
-		sock:    sock,
-		dataDir: dataDir,
+		sock:        sock,
+		pubSock:     mustNewPubSocket(pubEndpoint),
+		dataDir:     dataDir,
+		pubEndpoint: pubEndpoint,
 	}
+	defer server.pubSock.Close()
+	log.Printf("[SERVIDOR] Conectado ao proxy pub em %s", pubEndpoint)
 	server.initStorage()
 	server.registrarNoOrquestrador()
 	server.loop()
 }
 
 type Servidor struct {
-	sock    *zmq4.Socket
-	dataDir string
+	sock        *zmq4.Socket
+	pubSock     *zmq4.Socket
+	dataDir     string
+	pubEndpoint string
 }
 
 func (s *Servidor) loginsPath() string { return filepath.Join(s.dataDir, "logins.jsonl") }
 func (s *Servidor) canaisPath() string { return filepath.Join(s.dataDir, "canais.json") }
+func (s *Servidor) publicacoesPath() string {
+	return filepath.Join(s.dataDir, "publicacoes.jsonl")
+}
+
+func mustNewPubSocket(endpoint string) *zmq4.Socket {
+	sock, err := zmq4.NewSocket(zmq4.PUB)
+	if err != nil {
+		log.Fatalf("Novo socket PUB: %v", err)
+	}
+	if err := sock.Connect(endpoint); err != nil {
+		log.Fatalf("Conectar PUB ao proxy: %v", err)
+	}
+	return sock
+}
 
 func (s *Servidor) initStorage() {
 	if err := os.MkdirAll(s.dataDir, 0755); err != nil {
 		log.Fatalf("Criar DATA_DIR: %v", err)
 	}
-	for _, p := range []string{s.loginsPath(), s.canaisPath()} {
+	for _, p := range []string{s.loginsPath(), s.canaisPath(), s.publicacoesPath()} {
 		if _, err := os.Stat(p); os.IsNotExist(err) {
 			if p == s.canaisPath() {
 				_ = os.WriteFile(p, []byte("[]"), 0644)
@@ -114,6 +137,23 @@ func (s *Servidor) registrarLogin(nomeUsuario, timestampISO string) {
 	_, _ = f.Write(append(line, '\n'))
 }
 
+func (s *Servidor) registrarPublicacao(canal, mensagem, remetente, timestampISO string) {
+	line, _ := json.Marshal(
+		map[string]string{
+			"canal":     canal,
+			"mensagem":  mensagem,
+			"remetente": remetente,
+			"timestamp": timestampISO,
+		},
+	)
+	f, err := os.OpenFile(s.publicacoesPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(line, '\n'))
+}
+
 func (s *Servidor) loop() {
 	log.Println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
 	for {
@@ -144,6 +184,9 @@ func (s *Servidor) loop() {
 		case *protos.Envelope_ListChannelsReq:
 			log.Printf("[SERVIDOR] Servidor go processando mensagem: list_channels_req")
 			resp = s.processarListChannels(c.ListChannelsReq)
+		case *protos.Envelope_PublishReq:
+			log.Printf("[SERVIDOR] Servidor go processando mensagem: publish_req")
+			resp = s.processarPublish(c.PublishReq, env.GetCabecalho())
 		default:
 			log.Printf("[SERVIDOR] Tipo de mensagem não suportado: %T", conteudo)
 			continue
@@ -158,6 +201,8 @@ func (s *Servidor) loop() {
 			respEnv.Conteudo = &protos.Envelope_CreateChannelRes{CreateChannelRes: r}
 		case *protos.ListChannelsResponse:
 			respEnv.Conteudo = &protos.Envelope_ListChannelsRes{ListChannelsRes: r}
+		case *protos.PublishResponse:
+			respEnv.Conteudo = &protos.Envelope_PublishRes{PublishRes: r}
 		}
 		respData, _ := proto.Marshal(respEnv)
 		if _, err := s.sock.SendBytes(respData, 0); err != nil {
@@ -215,5 +260,70 @@ func (s *Servidor) processarListChannels(req *protos.ListChannelsRequest) *proto
 		Cabecalho: req.GetCabecalho(),
 		Canais:    s.lerCanais(),
 	}
+	return res
+}
+
+func (s *Servidor) processarPublish(
+	req *protos.PublishRequest,
+	envCabecalho *protos.Cabecalho,
+) *protos.PublishResponse {
+	res := &protos.PublishResponse{Cabecalho: req.GetCabecalho()}
+	canal := strings.TrimSpace(req.GetCanal())
+	mensagem := strings.TrimSpace(req.GetMensagem())
+
+	if canal == "" {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "canal vazio"
+		return res
+	}
+	if mensagem == "" {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "mensagem vazia"
+		return res
+	}
+
+	existe := false
+	for _, c := range s.lerCanais() {
+		if c == canal {
+			existe = true
+			break
+		}
+	}
+	if !existe {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "canal inexistente"
+		return res
+	}
+
+	remetente := "desconhecido"
+	if envCabecalho != nil && envCabecalho.GetLinguagemOrigem() != "" {
+		remetente = envCabecalho.GetLinguagemOrigem()
+	}
+	ts := req.GetCabecalho().GetTimestampEnvio()
+	channelMsg := &protos.ChannelMessage{
+		Canal:          canal,
+		Mensagem:       mensagem,
+		Remetente:      remetente,
+		TimestampEnvio: ts,
+	}
+	payload, err := proto.Marshal(channelMsg)
+	if err != nil {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "erro ao serializar publicacao"
+		return res
+	}
+	if _, err := s.pubSock.SendMessage([]byte(canal), payload); err != nil {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "erro ao publicar mensagem"
+		return res
+	}
+
+	timestampISO := time.Now().UTC().Format(time.RFC3339Nano)
+	if ts != nil {
+		timestampISO = fmt.Sprintf("%d.%09d", ts.GetSeconds(), ts.GetNanos())
+	}
+	s.registrarPublicacao(canal, mensagem, remetente, timestampISO)
+
+	res.Status = protos.Status_STATUS_SUCESSO
 	return res
 }

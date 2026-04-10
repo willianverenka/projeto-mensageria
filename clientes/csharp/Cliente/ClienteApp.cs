@@ -10,19 +10,27 @@ namespace Cliente;
 public class ClienteApp
 {
     private readonly string _orqEndpoint;
+    private readonly string _proxySubEndpoint;
     private readonly string _nomeUsuario;
     private readonly string _nomeCanal;
     private readonly DealerSocket _socket;
+    private readonly SubscriberSocket _subSocket;
+    private readonly HashSet<string> _inscricoes = [];
+    private readonly Random _random = new();
 
     public ClienteApp()
     {
         _orqEndpoint = Environment.GetEnvironmentVariable("ORQ_ENDPOINT") ?? "tcp://orquestrador:5555";
+        _proxySubEndpoint = Environment.GetEnvironmentVariable("PROXY_SUB_ENDPOINT") ?? "tcp://proxy:5558";
         _nomeUsuario = Environment.GetEnvironmentVariable("CLIENTE_NOME") ?? "cliente_csharp";
         _nomeCanal = Environment.GetEnvironmentVariable("CLIENTE_CANAL") ?? "canal_csharp";
 
         _socket = new DealerSocket();
         _socket.Connect(_orqEndpoint);
+        _subSocket = new SubscriberSocket();
+        _subSocket.Connect(_proxySubEndpoint);
         Console.WriteLine($"[CLIENTE] Conectado ao orquestrador em {_orqEndpoint}");
+        Console.WriteLine($"[CLIENTE] Conectado ao proxy sub em {_proxySubEndpoint}");
     }
 
     private Envelope EnviarEAguardar(Envelope env)
@@ -119,6 +127,58 @@ public class ClienteApp
         return canais;
     }
 
+    public bool Publicar(string canal, string mensagem)
+    {
+        var cab = Mensageria.NovoCabecalho(Mensageria.OrigemLabel("cliente"));
+        var env = new Envelope
+        {
+            Cabecalho = cab,
+            PublishReq = new PublishRequest
+            {
+                Cabecalho = cab.Clone(),
+                Canal = canal,
+                Mensagem = mensagem
+            }
+        };
+        var resp = EnviarEAguardar(env);
+        if (resp.ConteudoCase != Envelope.ConteudoOneofCase.PublishRes)
+            return false;
+        return resp.PublishRes.Status == Status.Sucesso;
+    }
+
+    public void Inscrever(string canal)
+    {
+        if (_inscricoes.Contains(canal))
+            return;
+        _subSocket.Subscribe(canal);
+        _inscricoes.Add(canal);
+        Console.WriteLine($"[CLIENTE] Inscrito no canal '{canal}'");
+    }
+
+    public void IniciarReceptor()
+    {
+        _ = Task.Run(() =>
+        {
+            while (true)
+            {
+                try
+                {
+                    var topic = _subSocket.ReceiveFrameString();
+                    var payload = _subSocket.ReceiveFrameBytes();
+                    var msg = ChannelMessage.Parser.ParseFrom(payload);
+                    var ts = msg.TimestampEnvio;
+                    Console.WriteLine(
+                        $"[CANAL={topic}] msg='{msg.Mensagem}' envio={ts.Seconds}.{ts.Nanos:D9} recebimento={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+                    );
+                }
+                catch
+                {
+                    Thread.Sleep(200);
+                }
+            }
+        });
+    }
+
     public void Run()
     {
         for (int i = 0; i < 3; i++)
@@ -127,12 +187,33 @@ public class ClienteApp
             Thread.Sleep(1000);
         }
 
-        CriarCanal(_nomeCanal);
-
-        for (int i = 0; i < 100; i++)
+        IniciarReceptor();
+        var canais = ListarCanais();
+        if (canais.Count < 5)
         {
-            ListarCanais();
-            Thread.Sleep(500);
+            CriarCanal($"{_nomeCanal}_{_random.Next(10_000)}");
+            canais = ListarCanais();
+        }
+        while (_inscricoes.Count < 3 && _inscricoes.Count < canais.Count)
+        {
+            var canal = canais[_random.Next(canais.Count)];
+            Inscrever(canal);
+        }
+
+        while (true)
+        {
+            canais = ListarCanais();
+            if (canais.Count == 0)
+            {
+                Thread.Sleep(1000);
+                continue;
+            }
+            var canal = canais[_random.Next(canais.Count)];
+            for (int i = 0; i < 10; i++)
+            {
+                Publicar(canal, $"msg_{_random.Next(1_000_000)}");
+                Thread.Sleep(1000);
+            }
         }
     }
 }

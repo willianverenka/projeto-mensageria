@@ -11,6 +11,16 @@ services:
       - "5555:5555"
       - "5556:5556"
 
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: proxy
+    command: ["python", "proxy.py"]
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
   servidor_python:
     build:
       context: .
@@ -19,11 +29,13 @@ services:
     command: ["python", "servidores/python/servidor.py"]
     environment:
       - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - PROXY_PUB_ENDPOINT=tcp://proxy:5557
       - DATA_DIR=/data
     volumes:
       - ./dados/servidor_python:/data
     depends_on:
       - orquestrador
+      - proxy
 
   cliente_python:
     build:
@@ -33,10 +45,12 @@ services:
     command: ["python", "clientes/python/cliente.py"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_python
       - CLIENTE_CANAL=canal_cliente_python
     depends_on:
       - orquestrador
+      - proxy
    #   - servidor_python
 
   servidor_go:
@@ -47,11 +61,13 @@ services:
     command: ["/servidor"]
     environment:
       - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - PROXY_PUB_ENDPOINT=tcp://proxy:5557
       - DATA_DIR=/data
     volumes:
       - ./dados/servidor_go:/data
     depends_on:
       - orquestrador
+      - proxy
 
   cliente_go:
     build:
@@ -61,10 +77,12 @@ services:
     command: ["/cliente"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_go
       - CLIENTE_CANAL=canal_go
     depends_on:
       - orquestrador
+      - proxy
       - servidor_go
 
   servidor_java:
@@ -75,11 +93,13 @@ services:
     command: ["ServidorJava"]
     environment:
       - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - PROXY_PUB_ENDPOINT=tcp://proxy:5557
       - DATA_DIR=/data
     volumes:
       - ./dados/servidor_java:/data
     depends_on:
       - orquestrador
+      - proxy
 
   cliente_java:
     build:
@@ -89,10 +109,12 @@ services:
     command: ["ClienteJava"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_java
       - CLIENTE_CANAL=canal_java
     depends_on:
       - orquestrador
+      - proxy
       - servidor_java
   servidor_csharp:
     platform: linux/amd64
@@ -102,11 +124,13 @@ services:
     container_name: servidor_csharp
     environment:
       - ORQ_ENDPOINT_SERVIDOR=tcp://orquestrador:5556
+      - PROXY_PUB_ENDPOINT=tcp://proxy:5557
       - DATA_DIR=/data
     volumes:
       - ./dados/servidor_csharp:/data
     depends_on:
       - orquestrador
+      - proxy
       
   cliente_csharp:
     platform: linux/amd64
@@ -117,8 +141,10 @@ services:
     entrypoint: ["dotnet", "cliente/Cliente.dll"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
+      - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_csharp
       - CLIENTE_CANAL=canal_csharp
     depends_on:
       - orquestrador
+      - proxy
       - servidor_csharp

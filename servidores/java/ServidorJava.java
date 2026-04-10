@@ -17,22 +17,28 @@ import shared.mensageria.Mensageria;
 
 public class ServidorJava {
   private final ZMQ.Socket socket;
+  private final ZMQ.Socket pubSocket;
   private final Path dataDir;
   private final Path loginsPath;
   private final Path canaisPath;
+  private final Path publicacoesPath;
 
   private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
 
-  public ServidorJava(String orqEndpoint, String dataDirStr) throws IOException {
+  public ServidorJava(String orqEndpoint, String proxyPubEndpoint, String dataDirStr) throws IOException {
     ZMQ.Context context = ZMQ.context(1);
     this.socket = context.socket(ZMQ.DEALER);
     this.socket.connect(orqEndpoint);
+    this.pubSocket = context.socket(ZMQ.PUB);
+    this.pubSocket.connect(proxyPubEndpoint);
 
     this.dataDir = Path.of(dataDirStr);
     this.loginsPath = this.dataDir.resolve("logins.jsonl");
     this.canaisPath = this.dataDir.resolve("canais.json");
+    this.publicacoesPath = this.dataDir.resolve("publicacoes.jsonl");
 
     System.out.println("[SERVIDOR] Conectado ao orquestrador em " + orqEndpoint);
+    System.out.println("[SERVIDOR] Conectado ao proxy pub em " + proxyPubEndpoint);
     initStorage();
     registrarNoOrquestrador();
   }
@@ -45,6 +51,9 @@ public class ServidorJava {
     }
     if (!Files.exists(canaisPath)) {
       Files.writeString(canaisPath, "[]", StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+    }
+    if (!Files.exists(publicacoesPath)) {
+      Files.write(publicacoesPath, new byte[0], StandardOpenOption.CREATE, StandardOpenOption.WRITE);
     }
   }
 
@@ -115,6 +124,25 @@ public class ServidorJava {
     }
   }
 
+  private void registrarPublicacao(String canal, String mensagem, String remetente, String timestampIso) {
+    Map<String, String> obj = new HashMap<>();
+    obj.put("canal", canal);
+    obj.put("mensagem", mensagem);
+    obj.put("remetente", remetente);
+    obj.put("timestamp", timestampIso);
+    String line = gson.toJson(obj);
+    try {
+      Files.writeString(
+          publicacoesPath,
+          line + "\n",
+          StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.APPEND
+      );
+    } catch (Exception e) {
+    }
+  }
+
   private Contrato.LoginResponse processarLogin(Contrato.LoginRequest req) {
     Contrato.LoginResponse.Builder res = Contrato.LoginResponse.newBuilder()
         .setCabecalho(req.getCabecalho());
@@ -171,6 +199,55 @@ public class ServidorJava {
         .build();
   }
 
+  private Contrato.PublishResponse processarPublish(
+      Contrato.PublishRequest req,
+      Contrato.Cabecalho envelopeCabecalho
+  ) {
+    Contrato.PublishResponse.Builder res = Contrato.PublishResponse.newBuilder()
+        .setCabecalho(req.getCabecalho());
+
+    String canal = req.getCanal().trim();
+    String mensagem = req.getMensagem().trim();
+    if (canal.isEmpty()) {
+      res.setStatus(Contrato.Status.STATUS_ERRO);
+      res.setErroMsg("canal vazio");
+      return res.build();
+    }
+    if (mensagem.isEmpty()) {
+      res.setStatus(Contrato.Status.STATUS_ERRO);
+      res.setErroMsg("mensagem vazia");
+      return res.build();
+    }
+
+    List<String> canais = lerCanais();
+    if (!canais.contains(canal)) {
+      res.setStatus(Contrato.Status.STATUS_ERRO);
+      res.setErroMsg("canal inexistente");
+      return res.build();
+    }
+
+    String remetente = envelopeCabecalho.getLinguagemOrigem().isBlank()
+        ? "desconhecido"
+        : envelopeCabecalho.getLinguagemOrigem();
+
+    Contrato.ChannelMessage channelMessage = Contrato.ChannelMessage.newBuilder()
+        .setCanal(canal)
+        .setMensagem(mensagem)
+        .setRemetente(remetente)
+        .setTimestampEnvio(req.getCabecalho().getTimestampEnvio())
+        .build();
+
+    pubSocket.sendMore(canal.getBytes(StandardCharsets.UTF_8));
+    pubSocket.send(channelMessage.toByteArray(), 0);
+
+    com.google.protobuf.Timestamp ts = req.getCabecalho().getTimestampEnvio();
+    String tsIso = ts.getSeconds() + "." + String.format("%09d", ts.getNanos());
+    registrarPublicacao(canal, mensagem, remetente, tsIso);
+
+    res.setStatus(Contrato.Status.STATUS_SUCESSO);
+    return res.build();
+  }
+
   public void loop() throws Exception {
     System.out.println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...");
     while (true) {
@@ -204,6 +281,10 @@ public class ServidorJava {
           System.out.println("[SERVIDOR] Servidor java processando mensagem: list_channels_req");
           respEnv.setListChannelsRes(processarListChannels(env.getListChannelsReq()));
           break;
+        case PUBLISH_REQ:
+          System.out.println("[SERVIDOR] Servidor java processando mensagem: publish_req");
+          respEnv.setPublishRes(processarPublish(env.getPublishReq(), env.getCabecalho()));
+          break;
         default:
           System.err.println("[SERVIDOR] Tipo de mensagem nao suportado: " + tipo);
           continue;
@@ -220,9 +301,10 @@ public class ServidorJava {
 
   public static void main(String[] args) throws Exception {
     String orqEndpoint = getEnv("ORQ_ENDPOINT_SERVIDOR", "tcp://orquestrador:5556");
+    String proxyPubEndpoint = getEnv("PROXY_PUB_ENDPOINT", "tcp://proxy:5557");
     String dataDir = getEnv("DATA_DIR", "/data");
 
-    ServidorJava servidor = new ServidorJava(orqEndpoint, dataDir);
+    ServidorJava servidor = new ServidorJava(orqEndpoint, proxyPubEndpoint, dataDir);
     servidor.loop();
   }
 }
