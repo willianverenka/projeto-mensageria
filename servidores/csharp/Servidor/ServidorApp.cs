@@ -10,25 +10,33 @@ namespace Servidor;
 public class ServidorApp
 {
     private readonly string _orqEndpoint;
+    private readonly string _proxyPubEndpoint;
     private readonly string _dataDir;
     private readonly string _loginsPath;
     private readonly string _canaisPath;
+    private readonly string _publicacoesPath;
     private readonly DealerSocket _socket;
+    private readonly PublisherSocket _pubSocket;
 
     public ServidorApp()
     {
         _orqEndpoint = Environment.GetEnvironmentVariable("ORQ_ENDPOINT_SERVIDOR") ?? "tcp://localhost:5556";
+        _proxyPubEndpoint = Environment.GetEnvironmentVariable("PROXY_PUB_ENDPOINT") ?? "tcp://proxy:5557";
         _dataDir = Environment.GetEnvironmentVariable("DATA_DIR") ?? "./data";
         
         Directory.CreateDirectory(_dataDir);
         _loginsPath = Path.Combine(_dataDir, "logins.jsonl");
         _canaisPath = Path.Combine(_dataDir, "canais.json");
+        _publicacoesPath = Path.Combine(_dataDir, "publicacoes.jsonl");
 
         InitStorage();
 
         _socket = new DealerSocket();
         _socket.Connect(_orqEndpoint);
         Console.WriteLine($"[SERVIDOR] Conectado ao orquestrador em {_orqEndpoint}");
+        _pubSocket = new PublisherSocket();
+        _pubSocket.Connect(_proxyPubEndpoint);
+        Console.WriteLine($"[SERVIDOR] Conectado ao proxy pub em {_proxyPubEndpoint}");
 
         //RegistrarNoOrquestrador();
     }
@@ -37,6 +45,7 @@ public class ServidorApp
     {
         if (!File.Exists(_loginsPath)) File.WriteAllText(_loginsPath, "");
         if (!File.Exists(_canaisPath)) File.WriteAllText(_canaisPath, "[]");
+        if (!File.Exists(_publicacoesPath)) File.WriteAllText(_publicacoesPath, "");
     }
 
     private void RegistrarNoOrquestrador()
@@ -70,6 +79,12 @@ public class ServidorApp
         File.AppendAllText(_loginsPath, entry + Environment.NewLine);
     }
 
+    private void RegistrarPublicacao(string canal, string mensagem, string remetente, string ts)
+    {
+        var entry = JsonSerializer.Serialize(new { canal, mensagem, remetente, timestamp = ts });
+        File.AppendAllText(_publicacoesPath, entry + Environment.NewLine);
+    }
+
     public void Loop()
     {
         Console.WriteLine("[SERVIDOR] Aguardando mensagens...");
@@ -85,6 +100,7 @@ public class ServidorApp
                 Envelope.ConteudoOneofCase.LoginReq => ProcessarLogin(env.LoginReq),
                 Envelope.ConteudoOneofCase.CreateChannelReq => ProcessarCreateChannel(env.CreateChannelReq),
                 Envelope.ConteudoOneofCase.ListChannelsReq => ProcessarListChannels(env.ListChannelsReq),
+                Envelope.ConteudoOneofCase.PublishReq => ProcessarPublish(env.PublishReq, env.Cabecalho),
                 _ => null
             };
 
@@ -95,6 +111,7 @@ public class ServidorApp
             if (resposta is LoginResponse lr) respEnv.LoginRes = lr;
             else if (resposta is CreateChannelResponse cr) respEnv.CreateChannelRes = cr;
             else if (resposta is ListChannelsResponse lcr) respEnv.ListChannelsRes = lcr;
+            else if (resposta is PublishResponse pr) respEnv.PublishRes = pr;
 
             _socket.SendFrame(respEnv.ToByteArray());
         }
@@ -149,6 +166,51 @@ public class ServidorApp
     {
         var res = new ListChannelsResponse { Cabecalho = req.Cabecalho.Clone() };
         res.Canais.AddRange(LerCanais());
+        return res;
+    }
+
+    private PublishResponse ProcessarPublish(PublishRequest req, Cabecalho envCabecalho)
+    {
+        var res = new PublishResponse { Cabecalho = req.Cabecalho.Clone() };
+        var canal = req.Canal?.Trim() ?? "";
+        var mensagem = req.Mensagem?.Trim() ?? "";
+
+        if (string.IsNullOrEmpty(canal))
+        {
+            res.Status = Status.Erro;
+            res.ErroMsg = "canal vazio";
+            return res;
+        }
+        if (string.IsNullOrEmpty(mensagem))
+        {
+            res.Status = Status.Erro;
+            res.ErroMsg = "mensagem vazia";
+            return res;
+        }
+
+        var canais = LerCanais();
+        if (!canais.Contains(canal))
+        {
+            res.Status = Status.Erro;
+            res.ErroMsg = "canal inexistente";
+            return res;
+        }
+
+        var remetente = string.IsNullOrWhiteSpace(envCabecalho.LinguagemOrigem) ? "desconhecido" : envCabecalho.LinguagemOrigem;
+        var channelMsg = new ChannelMessage
+        {
+            Canal = canal,
+            Mensagem = mensagem,
+            Remetente = remetente,
+            TimestampEnvio = req.Cabecalho.TimestampEnvio
+        };
+        _pubSocket.SendMoreFrame(canal).SendFrame(channelMsg.ToByteArray());
+
+        var ts = req.Cabecalho.TimestampEnvio;
+        var tsIso = $"{ts.Seconds}.{ts.Nanos:D9}";
+        RegistrarPublicacao(canal, mensagem, remetente, tsIso);
+
+        res.Status = Status.Sucesso;
         return res;
     }
 }
