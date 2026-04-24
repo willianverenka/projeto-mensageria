@@ -6,6 +6,7 @@ import java.util.Random;
 import java.util.Set;
 import org.zeromq.ZMQ;
 import shared.mensageria.Mensageria;
+import shared.mensageria.RelogioProcesso;
 
 public class ClienteJava {
   private final ZMQ.Socket socket;
@@ -15,8 +16,10 @@ public class ClienteJava {
   private final String proxySubEndpoint;
   private final String nomeUsuario;
   private final String nomeCanal;
+  private final String origem;
   private final Set<String> subscribedChannels = new HashSet<>();
   private final Random random = new Random();
+  private final RelogioProcesso relogio = new RelogioProcesso();
 
   public ClienteJava(
       String orqEndpoint,
@@ -28,6 +31,7 @@ public class ClienteJava {
     this.proxySubEndpoint = proxySubEndpoint;
     this.nomeUsuario = nomeUsuario;
     this.nomeCanal = nomeCanal;
+    this.origem = Mensageria.origemLabel("cliente");
 
     ZMQ.Context context = ZMQ.context(1);
     this.socket = context.socket(ZMQ.DEALER);
@@ -39,16 +43,24 @@ public class ClienteJava {
   }
 
   private Contrato.Envelope enviarEAguardar(Contrato.Envelope env) throws Exception {
+    System.out.println(
+        "[CLIENTE] Enviando " + env.getConteudoCase() + " " + Mensageria.cabecalhoTexto(env.getCabecalho())
+    );
     socket.send(Mensageria.envelopeBytes(env), 0);
     byte[] reply = socket.recv(0);
     if (reply == null) {
       throw new IllegalStateException("Resposta nula ao aguardar mensagem do servidor.");
     }
-    return Mensageria.envelopeFromBytes(reply);
+    Contrato.Envelope resp = Mensageria.envelopeFromBytes(reply);
+    relogio.onReceive(resp.getCabecalho().getRelogioLogico());
+    System.out.println(
+        "[CLIENTE] Recebido " + resp.getConteudoCase() + " " + Mensageria.cabecalhoTexto(resp.getCabecalho())
+    );
+    return resp;
   }
 
   private boolean fazerLogin(String nomeUsuario) throws Exception {
-    Contrato.Cabecalho cab = Mensageria.novoCabecalho(Mensageria.origemLabel("cliente"));
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
 
     Contrato.LoginRequest loginReq = Contrato.LoginRequest.newBuilder()
         .setCabecalho(cab)
@@ -60,7 +72,6 @@ public class ClienteJava {
         .setLoginReq(loginReq)
         .build();
 
-    System.out.println("[CLIENTE] Enviando LoginRequest para usuario '" + nomeUsuario + "'");
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.LOGIN_RES) {
@@ -79,7 +90,7 @@ public class ClienteJava {
   }
 
   private void criarCanal(String nomeCanal) throws Exception {
-    Contrato.Cabecalho cab = Mensageria.novoCabecalho(Mensageria.origemLabel("cliente"));
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
 
     Contrato.CreateChannelRequest req = Contrato.CreateChannelRequest.newBuilder()
         .setCabecalho(cab)
@@ -91,7 +102,6 @@ public class ClienteJava {
         .setCreateChannelReq(req)
         .build();
 
-    System.out.println("[CLIENTE] Solicitando criacao do canal '" + nomeCanal + "'");
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.CREATE_CHANNEL_RES) {
@@ -110,7 +120,7 @@ public class ClienteJava {
   }
 
   private List<String> listarCanais() throws Exception {
-    Contrato.Cabecalho cab = Mensageria.novoCabecalho(Mensageria.origemLabel("cliente"));
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
 
     Contrato.ListChannelsRequest req = Contrato.ListChannelsRequest.newBuilder()
         .setCabecalho(cab)
@@ -121,7 +131,6 @@ public class ClienteJava {
         .setListChannelsReq(req)
         .build();
 
-    System.out.println("[CLIENTE] Solicitando listagem de canais");
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.LIST_CHANNELS_RES) {
@@ -142,7 +151,7 @@ public class ClienteJava {
   }
 
   private boolean publicar(String canal, String mensagem) throws Exception {
-    Contrato.Cabecalho cab = Mensageria.novoCabecalho(Mensageria.origemLabel("cliente"));
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
     Contrato.PublishRequest req = Contrato.PublishRequest.newBuilder()
         .setCabecalho(cab)
         .setCanal(canal)
@@ -180,12 +189,13 @@ public class ClienteJava {
         try {
           String topic = new String(topicBytes, ZMQ.CHARSET);
           Contrato.ChannelMessage msg = Contrato.ChannelMessage.parseFrom(payload);
-          com.google.protobuf.Timestamp ts = msg.getTimestampEnvio();
-          long recvMs = System.currentTimeMillis();
+          relogio.onReceive(msg.getRelogioLogico());
           System.out.println(
-              "[CANAL=" + topic + "] msg='" + msg.getMensagem() + "' envio="
-                  + ts.getSeconds() + "." + String.format("%09d", ts.getNanos())
-                  + " recebimento=" + recvMs
+              "[CLIENTE] [CANAL=" + topic + "] msg='" + msg.getMensagem() + "' remetente="
+                  + msg.getRemetente()
+                  + " envio=" + Mensageria.timestampTexto(msg.getTimestampEnvio())
+                  + " recebimento=" + Mensageria.timestampTexto(Mensageria.timestampFromNs(Mensageria.agoraNs()))
+                  + " relogio=" + msg.getRelogioLogico()
           );
         } catch (Exception e) {
           System.err.println("[CLIENTE] Erro ao receber pub/sub: " + e.getMessage());
@@ -245,4 +255,3 @@ public class ClienteJava {
     cliente.executar();
   }
 }
-

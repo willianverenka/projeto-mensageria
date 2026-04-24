@@ -50,7 +50,13 @@ func main() {
 	}
 	log.Printf("[CLIENTE] Conectado ao proxy sub em %s", subEndpoint)
 
-	cliente := &Cliente{sock: sock, subSock: subSock, subscribed: map[string]bool{}}
+	cliente := &Cliente{
+		sock:       sock,
+		subSock:    subSock,
+		subscribed: map[string]bool{},
+		clock:      &mensageria.RelogioProcesso{},
+		origem:     mensageria.OrigemLabel(mensageria.RoleCliente),
+	}
 
 	for i := 0; i < 3; i++ {
 		if cliente.fazerLogin(nomeUsuario) {
@@ -88,6 +94,8 @@ type Cliente struct {
 	sock       *zmq4.Socket
 	subSock    *zmq4.Socket
 	subscribed map[string]bool
+	clock      *mensageria.RelogioProcesso
+	origem     string
 	mu         sync.Mutex
 }
 
@@ -98,11 +106,40 @@ func getEnv(name, defaultVal string) string {
 	return defaultVal
 }
 
+func agoraTexto() string {
+	agora := time.Now().UnixNano()
+	return fmt.Sprintf("%d.%09d", agora/1_000_000_000, agora%1_000_000_000)
+}
+
+func conteudoNome(env *protos.Envelope) string {
+	switch env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		return "login_req"
+	case *protos.Envelope_LoginRes:
+		return "login_res"
+	case *protos.Envelope_CreateChannelReq:
+		return "create_channel_req"
+	case *protos.Envelope_CreateChannelRes:
+		return "create_channel_res"
+	case *protos.Envelope_ListChannelsReq:
+		return "list_channels_req"
+	case *protos.Envelope_ListChannelsRes:
+		return "list_channels_res"
+	case *protos.Envelope_PublishReq:
+		return "publish_req"
+	case *protos.Envelope_PublishRes:
+		return "publish_res"
+	default:
+		return "desconhecido"
+	}
+}
+
 func (c *Cliente) enviarEAguardar(env *protos.Envelope) (*protos.Envelope, error) {
 	data, err := mensageria.EnvelopeBytes(env)
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("[CLIENTE] Enviando %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 	if _, err := c.sock.SendBytes(data, 0); err != nil {
 		return nil, err
 	}
@@ -110,11 +147,17 @@ func (c *Cliente) enviarEAguardar(env *protos.Envelope) (*protos.Envelope, error
 	if err != nil {
 		return nil, err
 	}
-	return mensageria.EnvelopeFromBytes(reply)
+	respEnv, err := mensageria.EnvelopeFromBytes(reply)
+	if err != nil {
+		return nil, err
+	}
+	c.clock.OnReceive(respEnv.GetCabecalho().GetRelogioLogico())
+	log.Printf("[CLIENTE] Recebido %T %s", respEnv.GetConteudo(), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
+	return respEnv, nil
 }
 
 func (c *Cliente) fazerLogin(nomeUsuario string) bool {
-	cab := mensageria.NovoCabecalho(mensageria.OrigemLabel(mensageria.RoleCliente))
+	cab := mensageria.NovoCabecalho(c.origem, c.clock)
 	req := &protos.LoginRequest{
 		Cabecalho:   cab,
 		NomeUsuario: nomeUsuario,
@@ -124,7 +167,6 @@ func (c *Cliente) fazerLogin(nomeUsuario string) bool {
 		Conteudo:  &protos.Envelope_LoginReq{LoginReq: req},
 	}
 
-	log.Printf("[CLIENTE] Enviando LoginRequest para usuário '%s'", nomeUsuario)
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
 		log.Printf("[CLIENTE] Erro ao enviar/aguardar login: %v", err)
@@ -146,7 +188,7 @@ func (c *Cliente) fazerLogin(nomeUsuario string) bool {
 }
 
 func (c *Cliente) criarCanal(nomeCanal string) {
-	cab := mensageria.NovoCabecalho(mensageria.OrigemLabel(mensageria.RoleCliente))
+	cab := mensageria.NovoCabecalho(c.origem, c.clock)
 	req := &protos.CreateChannelRequest{
 		Cabecalho: cab,
 		NomeCanal: nomeCanal,
@@ -156,7 +198,6 @@ func (c *Cliente) criarCanal(nomeCanal string) {
 		Conteudo:  &protos.Envelope_CreateChannelReq{CreateChannelReq: req},
 	}
 
-	log.Printf("[CLIENTE] Solicitando criação do canal '%s'", nomeCanal)
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
 		log.Printf("[CLIENTE] Erro ao criar canal: %v", err)
@@ -176,14 +217,13 @@ func (c *Cliente) criarCanal(nomeCanal string) {
 }
 
 func (c *Cliente) listarCanais() []string {
-	cab := mensageria.NovoCabecalho(mensageria.OrigemLabel(mensageria.RoleCliente))
+	cab := mensageria.NovoCabecalho(c.origem, c.clock)
 	req := &protos.ListChannelsRequest{Cabecalho: cab}
 	env := &protos.Envelope{
 		Cabecalho: cab,
 		Conteudo:  &protos.Envelope_ListChannelsReq{ListChannelsReq: req},
 	}
 
-	log.Printf("[CLIENTE] Solicitando listagem de canais")
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
 		log.Printf("[CLIENTE] Erro ao listar canais: %v", err)
@@ -205,7 +245,7 @@ func (c *Cliente) listarCanais() []string {
 }
 
 func (c *Cliente) publicar(canal, mensagem string) bool {
-	cab := mensageria.NovoCabecalho(mensageria.OrigemLabel(mensageria.RoleCliente))
+	cab := mensageria.NovoCabecalho(c.origem, c.clock)
 	req := &protos.PublishRequest{Cabecalho: cab, Canal: canal, Mensagem: mensagem}
 	env := &protos.Envelope{
 		Cabecalho: cab,
@@ -255,24 +295,23 @@ func (c *Cliente) iniciarReceptor() {
 			if err != nil {
 				continue
 			}
-			ts := channelMsg.GetTimestampEnvio()
-			now := time.Now()
+			c.clock.OnReceive(channelMsg.GetRelogioLogico())
 			log.Printf(
-				"[CANAL=%s] msg='%s' envio=%d.%09d recebimento=%d.%09d",
+				"[CLIENTE] [CANAL=%s] msg='%s' remetente=%s envio=%s recebimento=%s relogio=%d",
 				string(msg[0]),
 				channelMsg.GetMensagem(),
-				ts.GetSeconds(),
-				ts.GetNanos(),
-				now.Unix(),
-				now.Nanosecond(),
+				channelMsg.GetRemetente(),
+				mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()),
+				agoraTexto(),
+				channelMsg.GetRelogioLogico(),
 			)
 		}
 	}()
 }
 
-func randomMensagem(n int) string {
+func randomMensagem(length int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
+	b := make([]byte, length)
 	for i := range b {
 		b[i] = chars[rand.Intn(len(chars))]
 	}

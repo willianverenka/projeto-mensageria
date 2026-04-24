@@ -19,6 +19,7 @@ message Cabecalho {
   int32 id_transacao = 1;
   string linguagem_origem = 2;
   google.protobuf.Timestamp timestamp_envio = 3;
+  int64 relogio_logico = 4;
 }
 
 // ============================================================================
@@ -85,10 +86,52 @@ message ChannelMessage {
   string mensagem = 2;
   string remetente = 3;
   google.protobuf.Timestamp timestamp_envio = 4;
+  int64 relogio_logico = 5;
 }
 
 // ============================================================================
-// 6. Envelope unificado para trafegar em ZeroMQ
+// 7. Serviço de referência
+// ============================================================================
+
+message ServerInfo {
+  string nome = 1;
+  int32 rank = 2;
+}
+
+message RegisterServerRequest {
+  Cabecalho cabecalho = 1;
+  string nome_servidor = 2;
+}
+
+message RegisterServerResponse {
+  Cabecalho cabecalho = 1;
+  Status status = 2;
+  string erro_msg = 3;
+  int32 rank = 4;
+}
+
+message ListServersRequest {
+  Cabecalho cabecalho = 1;
+}
+
+message ListServersResponse {
+  Cabecalho cabecalho = 1;
+  repeated ServerInfo servidores = 2;
+}
+
+message HeartbeatRequest {
+  Cabecalho cabecalho = 1;
+  string nome_servidor = 2;
+}
+
+message HeartbeatResponse {
+  Cabecalho cabecalho = 1;
+  Status status = 2;
+  string erro_msg = 3;
+}
+
+// ============================================================================
+// 8. Envelope unificado para trafegar em ZeroMQ
 // ============================================================================
 
 
@@ -113,5 +156,13 @@ message Envelope {
     // Publicacao
     PublishRequest  publish_req = 8;
     PublishResponse publish_res = 9;
+
+    // Referência
+    RegisterServerRequest  register_server_req = 10;
+    RegisterServerResponse register_server_res = 11;
+    ListServersRequest  list_servers_req = 12;
+    ListServersResponse list_servers_res = 13;
+    HeartbeatRequest  heartbeat_req = 14;
+    HeartbeatResponse heartbeat_res = 15;
   }
 }

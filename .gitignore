@@ -1,6 +1,5 @@
 # Dados de runtime (persistência dos servidores)
-dados/**/logins.jsonl
-dados/**/canais.json
+dados/
 
 # --- C# / .NET ---
 bin/
@@ -15,6 +14,7 @@ publish/
 # Arquivos de cache do NuGet
 project.lock.json
 project.fragment.lock.json
+.cache/
 
 # --- JetBrains Rider / Visual Studio ---
 .idea/

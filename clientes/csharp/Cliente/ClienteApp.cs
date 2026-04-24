@@ -1,5 +1,3 @@
-// See https://aka.ms/new-console-template for more information
-
 using Chat;
 using NetMQ;
 using NetMQ.Sockets;
@@ -13,10 +11,12 @@ public class ClienteApp
     private readonly string _proxySubEndpoint;
     private readonly string _nomeUsuario;
     private readonly string _nomeCanal;
+    private readonly string _origem;
     private readonly DealerSocket _socket;
     private readonly SubscriberSocket _subSocket;
     private readonly HashSet<string> _inscricoes = [];
     private readonly Random _random = new();
+    private readonly RelogioProcesso _relogio = new();
 
     public ClienteApp()
     {
@@ -24,6 +24,7 @@ public class ClienteApp
         _proxySubEndpoint = Environment.GetEnvironmentVariable("PROXY_SUB_ENDPOINT") ?? "tcp://proxy:5558";
         _nomeUsuario = Environment.GetEnvironmentVariable("CLIENTE_NOME") ?? "cliente_csharp";
         _nomeCanal = Environment.GetEnvironmentVariable("CLIENTE_CANAL") ?? "canal_csharp";
+        _origem = Mensageria.OrigemLabel("cliente");
 
         _socket = new DealerSocket();
         _socket.Connect(_orqEndpoint);
@@ -35,14 +36,18 @@ public class ClienteApp
 
     private Envelope EnviarEAguardar(Envelope env)
     {
+        Console.WriteLine($"[CLIENTE] Enviando {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
         _socket.SendFrame(Mensageria.EnvelopeBytes(env));
         var data = _socket.ReceiveFrameBytes();
-        return Mensageria.EnvelopeFromBytes(data);
+        var resp = Mensageria.EnvelopeFromBytes(data);
+        _relogio.OnReceive(resp.Cabecalho.RelogioLogico);
+        Console.WriteLine($"[CLIENTE] Recebido {resp.ConteudoCase} {Mensageria.CabecalhoTexto(resp.Cabecalho)}");
+        return resp;
     }
 
     public bool FazerLogin(string nomeUsuario)
     {
-        var cab = Mensageria.NovoCabecalho(Mensageria.OrigemLabel("cliente"));
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var env = new Envelope
         {
             Cabecalho = cab,
@@ -53,7 +58,6 @@ public class ClienteApp
             }
         };
 
-        Console.WriteLine($"[CLIENTE] Enviando LoginRequest para usuário '{nomeUsuario}'");
         var resp = EnviarEAguardar(env);
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.LoginRes)
@@ -74,7 +78,7 @@ public class ClienteApp
 
     public void CriarCanal(string nomeCanal)
     {
-        var cab = Mensageria.NovoCabecalho(Mensageria.OrigemLabel("cliente"));
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var env = new Envelope
         {
             Cabecalho = cab,
@@ -85,7 +89,6 @@ public class ClienteApp
             }
         };
 
-        Console.WriteLine($"[CLIENTE] Solicitando criação do canal '{nomeCanal}'");
         var resp = EnviarEAguardar(env);
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.CreateChannelRes)
@@ -102,7 +105,7 @@ public class ClienteApp
 
     public List<string> ListarCanais()
     {
-        var cab = Mensageria.NovoCabecalho(Mensageria.OrigemLabel("cliente"));
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var env = new Envelope
         {
             Cabecalho = cab,
@@ -112,13 +115,12 @@ public class ClienteApp
             }
         };
 
-        Console.WriteLine("[CLIENTE] Solicitando listagem de canais");
         var resp = EnviarEAguardar(env);
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.ListChannelsRes)
         {
             Console.WriteLine($"[CLIENTE] Resposta inesperada a listagem de canais: {resp.ConteudoCase}");
-            return new List<string>();
+            return [];
         }
 
         var canais = resp.ListChannelsRes.Canais.ToList();
@@ -129,7 +131,7 @@ public class ClienteApp
 
     public bool Publicar(string canal, string mensagem)
     {
-        var cab = Mensageria.NovoCabecalho(Mensageria.OrigemLabel("cliente"));
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var env = new Envelope
         {
             Cabecalho = cab,
@@ -166,9 +168,9 @@ public class ClienteApp
                     var topic = _subSocket.ReceiveFrameString();
                     var payload = _subSocket.ReceiveFrameBytes();
                     var msg = ChannelMessage.Parser.ParseFrom(payload);
-                    var ts = msg.TimestampEnvio;
+                    _relogio.OnReceive(msg.RelogioLogico);
                     Console.WriteLine(
-                        $"[CANAL={topic}] msg='{msg.Mensagem}' envio={ts.Seconds}.{ts.Nanos:D9} recebimento={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+                        $"[CLIENTE] [CANAL={topic}] msg='{msg.Mensagem}' remetente={msg.Remetente} envio={Mensageria.TimestampTexto(msg.TimestampEnvio)} recebimento={Mensageria.TimestampTexto(Mensageria.TimestampFromNs(Mensageria.AgoraNs()))} relogio={msg.RelogioLogico}"
                     );
                 }
                 catch

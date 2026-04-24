@@ -9,10 +9,13 @@ from typing import List
 import zmq
 
 from shared.mensageria import (
+    RelogioProcesso,
+    cabecalho_texto,
     envelope_bytes,
     envelope_from_bytes,
     novo_cabecalho,
     origem_label,
+    timestamp_to_text,
 )
 from shared.protos import contrato_pb2
 
@@ -26,6 +29,11 @@ NOME_USUARIO = os.getenv("CLIENTE_NOME", "cliente_python")
 NOME_CANAL = os.getenv("CLIENTE_CANAL", "canal_padrao")
 
 
+def _agora_texto() -> str:
+    agora_ns = time.time_ns()
+    return f"{agora_ns // 1_000_000_000}.{agora_ns % 1_000_000_000:09d}"
+
+
 class Cliente:
     def __init__(self) -> None:
         self.context = zmq.Context.instance()
@@ -34,23 +42,33 @@ class Cliente:
         self.sub_socket = self.context.socket(zmq.SUB)
         self.sub_socket.connect(PROXY_SUB_ENDPOINT)
         self.subscribed_channels: set[str] = set()
+        self.relogio = RelogioProcesso()
+        self.origem = origem_label("cliente")
         logging.info("Conectado ao orquestrador em %s", ORQ_ENDPOINT)
         logging.info("Conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
 
     def _enviar_e_aguardar(self, env: contrato_pb2.Envelope) -> contrato_pb2.Envelope:
+        tipo = env.WhichOneof("conteudo") or "desconhecido"
+        logging.info("Enviando %s %s", tipo, cabecalho_texto(env.cabecalho))
         self.socket.send(envelope_bytes(env))
         data = self.socket.recv()
-        return envelope_from_bytes(data)
+        resp_env = envelope_from_bytes(data)
+        self.relogio.on_receive(resp_env.cabecalho.relogio_logico)
+        logging.info(
+            "Recebido %s %s",
+            resp_env.WhichOneof("conteudo") or "desconhecido",
+            cabecalho_texto(resp_env.cabecalho),
+        )
+        return resp_env
 
     def fazer_login(self, nome_usuario: str) -> bool:
         env = contrato_pb2.Envelope()
-        env.cabecalho.CopyFrom(novo_cabecalho(origem_label("cliente")))
+        env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
         login_req = contrato_pb2.LoginRequest()
         login_req.cabecalho.CopyFrom(env.cabecalho)
         login_req.nome_usuario = nome_usuario
         env.login_req.CopyFrom(login_req)
 
-        logging.info("Enviando LoginRequest para usuário '%s'", nome_usuario)
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "login_res":
@@ -67,13 +85,12 @@ class Cliente:
 
     def criar_canal(self, nome_canal: str) -> None:
         env = contrato_pb2.Envelope()
-        env.cabecalho.CopyFrom(novo_cabecalho(origem_label("cliente")))
+        env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
         req = contrato_pb2.CreateChannelRequest()
         req.cabecalho.CopyFrom(env.cabecalho)
         req.nome_canal = nome_canal
         env.create_channel_req.CopyFrom(req)
 
-        logging.info("Solicitando criação do canal '%s'", nome_canal)
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "create_channel_res":
@@ -88,12 +105,11 @@ class Cliente:
 
     def listar_canais(self) -> List[str]:
         env = contrato_pb2.Envelope()
-        env.cabecalho.CopyFrom(novo_cabecalho(origem_label("cliente")))
+        env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
         req = contrato_pb2.ListChannelsRequest()
         req.cabecalho.CopyFrom(env.cabecalho)
         env.list_channels_req.CopyFrom(req)
 
-        logging.info("Solicitando listagem de canais")
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "list_channels_res":
@@ -102,12 +118,12 @@ class Cliente:
 
         res = resp_env.list_channels_res
         canais = list(res.canais)
-        logging.info("Canais existentes: %s", ", ".join(canais) if canais else "(nenhum) ")
+        logging.info("Canais existentes: %s", ", ".join(canais) if canais else "(nenhum)")
         return canais
 
     def publicar(self, canal: str, mensagem: str) -> bool:
         env = contrato_pb2.Envelope()
-        env.cabecalho.CopyFrom(novo_cabecalho(origem_label("cliente")))
+        env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
         req = contrato_pb2.PublishRequest()
         req.cabecalho.CopyFrom(env.cabecalho)
         req.canal = canal
@@ -137,17 +153,17 @@ class Cliente:
             while True:
                 try:
                     topic, payload = self.sub_socket.recv_multipart()
-                    recv_ts = time.time()
                     msg = contrato_pb2.ChannelMessage()
                     msg.ParseFromString(payload)
-                    send_ts = f"{msg.timestamp_envio.seconds}.{msg.timestamp_envio.nanos:09d}"
-                    recv_ts_iso = f"{recv_ts:.9f}"
+                    self.relogio.on_receive(msg.relogio_logico)
                     logging.info(
-                        "[CANAL=%s] msg='%s' envio=%s recebimento=%s",
+                        "[CANAL=%s] msg='%s' remetente=%s envio=%s recebimento=%s relogio=%s",
                         topic.decode("utf-8"),
                         msg.mensagem,
-                        send_ts,
-                        recv_ts_iso,
+                        msg.remetente,
+                        timestamp_to_text(msg.timestamp_envio),
+                        _agora_texto(),
+                        msg.relogio_logico,
                     )
                 except Exception as exc:
                     logging.warning("Erro no receptor de pub/sub: %s", exc)
@@ -194,4 +210,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
