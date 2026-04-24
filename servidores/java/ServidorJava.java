@@ -14,23 +14,40 @@ import java.util.List;
 import java.util.Map;
 import org.zeromq.ZMQ;
 import shared.mensageria.Mensageria;
+import shared.mensageria.RelogioProcesso;
 
 public class ServidorJava {
   private final ZMQ.Socket socket;
   private final ZMQ.Socket pubSocket;
+  private final ZMQ.Socket refSocket;
   private final Path dataDir;
   private final Path loginsPath;
   private final Path canaisPath;
   private final Path publicacoesPath;
+  private final String origem;
+  private final String serverName;
+  private final RelogioProcesso relogio = new RelogioProcesso();
+
+  private int requestsProcessadas = 0;
 
   private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
 
-  public ServidorJava(String orqEndpoint, String proxyPubEndpoint, String dataDirStr) throws IOException {
+  public ServidorJava(
+      String orqEndpoint,
+      String proxyPubEndpoint,
+      String referenceEndpoint,
+      String dataDirStr,
+      String serverName
+  ) throws Exception {
     ZMQ.Context context = ZMQ.context(1);
     this.socket = context.socket(ZMQ.DEALER);
     this.socket.connect(orqEndpoint);
     this.pubSocket = context.socket(ZMQ.PUB);
     this.pubSocket.connect(proxyPubEndpoint);
+    this.refSocket = context.socket(ZMQ.REQ);
+    this.refSocket.connect(referenceEndpoint);
+    this.origem = Mensageria.origemLabel("servidor");
+    this.serverName = serverName;
 
     this.dataDir = Path.of(dataDirStr);
     this.loginsPath = this.dataDir.resolve("logins.jsonl");
@@ -39,8 +56,10 @@ public class ServidorJava {
 
     System.out.println("[SERVIDOR] Conectado ao orquestrador em " + orqEndpoint);
     System.out.println("[SERVIDOR] Conectado ao proxy pub em " + proxyPubEndpoint);
+    System.out.println("[SERVIDOR] Conectado à referência em " + referenceEndpoint);
     initStorage();
-    registrarNoOrquestrador();
+    registrarNaReferencia();
+    listarServidoresReferencia();
   }
 
   private void initStorage() throws IOException {
@@ -57,25 +76,100 @@ public class ServidorJava {
     }
   }
 
-  private void registrarNoOrquestrador() {
-    try {
-      Contrato.Cabecalho cab = Mensageria.novoCabecalho(Mensageria.origemLabel("servidor"));
-      Contrato.ListChannelsRequest req =
-          Contrato.ListChannelsRequest.newBuilder().setCabecalho(cab).build();
-
-      Contrato.Envelope env = Contrato.Envelope.newBuilder()
-          .setCabecalho(cab)
-          .setListChannelsReq(req)
-          .build();
-
-      byte[] data = Mensageria.envelopeBytes(env);
-      socket.send(data, ZMQ.DONTWAIT);
-      System.out.println("[SERVIDOR] Registro inicial enviado ao orquestrador.");
-    } catch (Exception e) {
-      System.out.println(
-          "[SERVIDOR] Aviso: nao foi possivel enviar mensagem de registro ao orquestrador."
-      );
+  private Contrato.Envelope enviarParaReferencia(Contrato.Envelope env, boolean atualizarOffset) throws Exception {
+    System.out.println(
+        "[SERVIDOR] Enviando " + env.getConteudoCase() + " para referência " + Mensageria.cabecalhoTexto(env.getCabecalho())
+    );
+    long envioNs = Mensageria.agoraNs();
+    refSocket.send(Mensageria.envelopeBytes(env), 0);
+    byte[] reply = refSocket.recv(0);
+    if (reply == null) {
+      throw new IllegalStateException("Resposta nula da referência.");
     }
+    long recebimentoNs = Mensageria.agoraNs();
+    Contrato.Envelope resp = Mensageria.envelopeFromBytes(reply);
+    relogio.onReceive(resp.getCabecalho().getRelogioLogico());
+    if (atualizarOffset) {
+      relogio.atualizarOffset(resp.getCabecalho().getTimestampEnvio(), envioNs, recebimentoNs);
+      System.out.println("[SERVIDOR] Offset físico atualizado para " + relogio.offsetMillis() + " ms");
+    }
+    System.out.println(
+        "[SERVIDOR] Recebido " + resp.getConteudoCase() + " da referência " + Mensageria.cabecalhoTexto(resp.getCabecalho())
+    );
+    return resp;
+  }
+
+  private void registrarNaReferencia() throws Exception {
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
+    Contrato.RegisterServerRequest req = Contrato.RegisterServerRequest.newBuilder()
+        .setCabecalho(cab)
+        .setNomeServidor(serverName)
+        .build();
+    Contrato.Envelope env = Contrato.Envelope.newBuilder()
+        .setCabecalho(cab)
+        .setRegisterServerReq(req)
+        .build();
+
+    Contrato.Envelope resp = enviarParaReferencia(env, true);
+    if (resp.getConteudoCase() != Contrato.Envelope.ConteudoCase.REGISTER_SERVER_RES) {
+      throw new IllegalStateException("Resposta inesperada ao registrar na referência: " + resp.getConteudoCase());
+    }
+    Contrato.RegisterServerResponse res = resp.getRegisterServerRes();
+    if (res.getStatus() != Contrato.Status.STATUS_SUCESSO) {
+      throw new IllegalStateException("Falha ao registrar na referência: " + res.getErroMsg());
+    }
+    System.out.println("[SERVIDOR] Servidor " + serverName + " registrado na referência com rank=" + res.getRank());
+  }
+
+  private List<Contrato.ServerInfo> listarServidoresReferencia() throws Exception {
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
+    Contrato.ListServersRequest req = Contrato.ListServersRequest.newBuilder()
+        .setCabecalho(cab)
+        .build();
+    Contrato.Envelope env = Contrato.Envelope.newBuilder()
+        .setCabecalho(cab)
+        .setListServersReq(req)
+        .build();
+    Contrato.Envelope resp = enviarParaReferencia(env, true);
+    if (resp.getConteudoCase() != Contrato.Envelope.ConteudoCase.LIST_SERVERS_RES) {
+      System.err.println("[SERVIDOR] Resposta inesperada ao listar servidores: " + resp.getConteudoCase());
+      return new ArrayList<>();
+    }
+    List<Contrato.ServerInfo> servidores = new ArrayList<>(resp.getListServersRes().getServidoresList());
+    if (servidores.isEmpty()) {
+      System.out.println("[SERVIDOR] Servidores disponíveis na referência: (nenhum)");
+    } else {
+      List<String> partes = new ArrayList<>();
+      for (Contrato.ServerInfo servidor : servidores) {
+        partes.add(servidor.getNome() + "(rank=" + servidor.getRank() + ")");
+      }
+      System.out.println("[SERVIDOR] Servidores disponíveis na referência: " + String.join(", ", partes));
+    }
+    return servidores;
+  }
+
+  private void heartbeatESincronizar() throws Exception {
+    Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
+    Contrato.HeartbeatRequest req = Contrato.HeartbeatRequest.newBuilder()
+        .setCabecalho(cab)
+        .setNomeServidor(serverName)
+        .build();
+    Contrato.Envelope env = Contrato.Envelope.newBuilder()
+        .setCabecalho(cab)
+        .setHeartbeatReq(req)
+        .build();
+    Contrato.Envelope resp = enviarParaReferencia(env, true);
+    if (resp.getConteudoCase() != Contrato.Envelope.ConteudoCase.HEARTBEAT_RES) {
+      System.err.println("[SERVIDOR] Resposta inesperada ao heartbeat: " + resp.getConteudoCase());
+      return;
+    }
+    Contrato.HeartbeatResponse res = resp.getHeartbeatRes();
+    if (res.getStatus() != Contrato.Status.STATUS_SUCESSO) {
+      System.err.println("[SERVIDOR] Heartbeat rejeitado: " + res.getErroMsg());
+      return;
+    }
+    System.out.println("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
+    listarServidoresReferencia();
   }
 
   private List<String> lerCanais() {
@@ -144,30 +238,22 @@ public class ServidorJava {
   }
 
   private Contrato.LoginResponse processarLogin(Contrato.LoginRequest req) {
-    Contrato.LoginResponse.Builder res = Contrato.LoginResponse.newBuilder()
-        .setCabecalho(req.getCabecalho());
+    Contrato.LoginResponse.Builder res = Contrato.LoginResponse.newBuilder();
 
     String nome = req.getNomeUsuario().trim();
     if (nome.isEmpty()) {
       res.setStatus(Contrato.Status.STATUS_ERRO);
-      res.setErroMsg("nome de usu\\u00e1rio vazio");
+      res.setErroMsg("nome de usuário vazio");
       return res.build();
     }
 
-    com.google.protobuf.Timestamp ts = req.getCabecalho().getTimestampEnvio();
-    String tsIso = "";
-    if (ts.getSeconds() != 0 || ts.getNanos() != 0) {
-      tsIso = ts.getSeconds() + "." + String.format("%09d", ts.getNanos());
-    }
-    registrarLogin(nome, tsIso);
-
+    registrarLogin(nome, Mensageria.timestampTexto(req.getCabecalho().getTimestampEnvio()));
     res.setStatus(Contrato.Status.STATUS_SUCESSO);
     return res.build();
   }
 
   private Contrato.CreateChannelResponse processarCreateChannel(Contrato.CreateChannelRequest req) {
-    Contrato.CreateChannelResponse.Builder res = Contrato.CreateChannelResponse.newBuilder()
-        .setCabecalho(req.getCabecalho());
+    Contrato.CreateChannelResponse.Builder res = Contrato.CreateChannelResponse.newBuilder();
 
     String nome = req.getNomeCanal().trim();
     if (nome.isEmpty()) {
@@ -180,7 +266,7 @@ public class ServidorJava {
     for (String c : canais) {
       if (c.equals(nome)) {
         res.setStatus(Contrato.Status.STATUS_ERRO);
-        res.setErroMsg("canal j\\u00e1 existe");
+        res.setErroMsg("canal já existe");
         return res.build();
       }
     }
@@ -192,9 +278,8 @@ public class ServidorJava {
     return res.build();
   }
 
-  private Contrato.ListChannelsResponse processarListChannels(Contrato.ListChannelsRequest req) {
+  private Contrato.ListChannelsResponse processarListChannels() {
     return Contrato.ListChannelsResponse.newBuilder()
-        .setCabecalho(req.getCabecalho())
         .addAllCanais(lerCanais())
         .build();
   }
@@ -203,8 +288,7 @@ public class ServidorJava {
       Contrato.PublishRequest req,
       Contrato.Cabecalho envelopeCabecalho
   ) {
-    Contrato.PublishResponse.Builder res = Contrato.PublishResponse.newBuilder()
-        .setCabecalho(req.getCabecalho());
+    Contrato.PublishResponse.Builder res = Contrato.PublishResponse.newBuilder();
 
     String canal = req.getCanal().trim();
     String mensagem = req.getMensagem().trim();
@@ -230,19 +314,24 @@ public class ServidorJava {
         ? "desconhecido"
         : envelopeCabecalho.getLinguagemOrigem();
 
+    Contrato.Cabecalho cabPub = Mensageria.novoCabecalho(origem, relogio);
     Contrato.ChannelMessage channelMessage = Contrato.ChannelMessage.newBuilder()
         .setCanal(canal)
         .setMensagem(mensagem)
         .setRemetente(remetente)
-        .setTimestampEnvio(req.getCabecalho().getTimestampEnvio())
+        .setTimestampEnvio(cabPub.getTimestampEnvio())
+        .setRelogioLogico(cabPub.getRelogioLogico())
         .build();
 
+    System.out.println(
+        "[SERVIDOR] Publicando em " + canal
+            + " ts=" + Mensageria.timestampTexto(channelMessage.getTimestampEnvio())
+            + " relogio=" + channelMessage.getRelogioLogico()
+    );
     pubSocket.sendMore(canal.getBytes(StandardCharsets.UTF_8));
     pubSocket.send(channelMessage.toByteArray(), 0);
 
-    com.google.protobuf.Timestamp ts = req.getCabecalho().getTimestampEnvio();
-    String tsIso = ts.getSeconds() + "." + String.format("%09d", ts.getNanos());
-    registrarPublicacao(canal, mensagem, remetente, tsIso);
+    registrarPublicacao(canal, mensagem, remetente, Mensageria.timestampTexto(channelMessage.getTimestampEnvio()));
 
     res.setStatus(Contrato.Status.STATUS_SUCESSO);
     return res.build();
@@ -264,33 +353,43 @@ public class ServidorJava {
         continue;
       }
 
+      relogio.onReceive(env.getCabecalho().getRelogioLogico());
       Contrato.Envelope.ConteudoCase tipo = env.getConteudoCase();
-      Contrato.Cabecalho outerCab = Mensageria.novoCabecalho(Mensageria.origemLabel("servidor"));
-      Contrato.Envelope.Builder respEnv = Contrato.Envelope.newBuilder().setCabecalho(outerCab);
+      System.out.println("[SERVIDOR] Recebido " + tipo + " " + Mensageria.cabecalhoTexto(env.getCabecalho()));
 
-      switch (tipo) {
-        case LOGIN_REQ:
-          System.out.println("[SERVIDOR] Servidor java processando mensagem: login_req");
-          respEnv.setLoginRes(processarLogin(env.getLoginReq()));
-          break;
-        case CREATE_CHANNEL_REQ:
-          System.out.println("[SERVIDOR] Servidor java processando mensagem: create_channel_req");
-          respEnv.setCreateChannelRes(processarCreateChannel(env.getCreateChannelReq()));
-          break;
-        case LIST_CHANNELS_REQ:
-          System.out.println("[SERVIDOR] Servidor java processando mensagem: list_channels_req");
-          respEnv.setListChannelsRes(processarListChannels(env.getListChannelsReq()));
-          break;
-        case PUBLISH_REQ:
-          System.out.println("[SERVIDOR] Servidor java processando mensagem: publish_req");
-          respEnv.setPublishRes(processarPublish(env.getPublishReq(), env.getCabecalho()));
-          break;
-        default:
-          System.err.println("[SERVIDOR] Tipo de mensagem nao suportado: " + tipo);
-          continue;
+      Object resposta = switch (tipo) {
+        case LOGIN_REQ -> processarLogin(env.getLoginReq());
+        case CREATE_CHANNEL_REQ -> processarCreateChannel(env.getCreateChannelReq());
+        case LIST_CHANNELS_REQ -> processarListChannels();
+        case PUBLISH_REQ -> processarPublish(env.getPublishReq(), env.getCabecalho());
+        default -> null;
+      };
+
+      if (resposta == null) {
+        System.err.println("[SERVIDOR] Tipo de mensagem nao suportado: " + tipo);
+        continue;
       }
 
+      Contrato.Cabecalho outerCab = Mensageria.novoCabecalho(origem, relogio);
+      Contrato.Envelope.Builder respEnv = Contrato.Envelope.newBuilder().setCabecalho(outerCab);
+
+      if (resposta instanceof Contrato.LoginResponse lr) {
+        respEnv.setLoginRes(lr.toBuilder().setCabecalho(outerCab).build());
+      } else if (resposta instanceof Contrato.CreateChannelResponse cr) {
+        respEnv.setCreateChannelRes(cr.toBuilder().setCabecalho(outerCab).build());
+      } else if (resposta instanceof Contrato.ListChannelsResponse lcr) {
+        respEnv.setListChannelsRes(lcr.toBuilder().setCabecalho(outerCab).build());
+      } else if (resposta instanceof Contrato.PublishResponse pr) {
+        respEnv.setPublishRes(pr.toBuilder().setCabecalho(outerCab).build());
+      }
+
+      System.out.println("[SERVIDOR] Enviando " + respEnv.getConteudoCase() + " " + Mensageria.cabecalhoTexto(outerCab));
       socket.send(Mensageria.envelopeBytes(respEnv.build()), 0);
+
+      requestsProcessadas += 1;
+      if (requestsProcessadas % 10 == 0) {
+        heartbeatESincronizar();
+      }
     }
   }
 
@@ -302,10 +401,11 @@ public class ServidorJava {
   public static void main(String[] args) throws Exception {
     String orqEndpoint = getEnv("ORQ_ENDPOINT_SERVIDOR", "tcp://orquestrador:5556");
     String proxyPubEndpoint = getEnv("PROXY_PUB_ENDPOINT", "tcp://proxy:5557");
+    String referenceEndpoint = getEnv("REFERENCE_ENDPOINT", "tcp://referencia:5559");
     String dataDir = getEnv("DATA_DIR", "/data");
+    String serverName = getEnv("SERVER_NAME", "servidor_java");
 
-    ServidorJava servidor = new ServidorJava(orqEndpoint, proxyPubEndpoint, dataDir);
+    ServidorJava servidor = new ServidorJava(orqEndpoint, proxyPubEndpoint, referenceEndpoint, dataDir, serverName);
     servidor.loop();
   }
 }
-
