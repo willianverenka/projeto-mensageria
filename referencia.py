@@ -83,6 +83,9 @@ class Referencia:
 
             resposta_env = contrato_pb2.Envelope()
             cab = self._resposta_vazia()
+            if tipo == "heartbeat_req":
+                cab.timestamp_envio.seconds = 0
+                cab.timestamp_envio.nanos = 0
             resposta_env.cabecalho.CopyFrom(cab)
 
             if tipo == "register_server_req":
