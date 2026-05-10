@@ -52,7 +52,7 @@ services:
       context: .
       dockerfile: Dockerfile.python
     container_name: cliente_python
-    command: ["python", "clientes/python/cliente.py"]
+    command: ["sh", "-lc", "sleep 15 && python clientes/python/cliente.py"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
@@ -87,7 +87,7 @@ services:
       context: .
       dockerfile: Dockerfile.go
     container_name: cliente_go
-    command: ["/cliente"]
+    command: ["sh", "-lc", "sleep 15 && /cliente"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
@@ -122,7 +122,7 @@ services:
       context: .
       dockerfile: Dockerfile.java
     container_name: cliente_java
-    command: ["ClienteJava"]
+    entrypoint: ["sh", "-lc", "sleep 15 && java -cp /app/out:/app/lib/* ClienteJava"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
@@ -157,7 +157,7 @@ services:
       context: .
       dockerfile: Dockerfile.csharp
     container_name: cliente_csharp
-    entrypoint: ["dotnet", "cliente/Cliente.dll"]
+    entrypoint: ["sh", "-lc", "sleep 15 && dotnet cliente/Cliente.dll"]
     environment:
       - ORQ_ENDPOINT=tcp://orquestrador:5555
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558

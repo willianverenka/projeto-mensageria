@@ -12,6 +12,8 @@ public class ServidorApp
     private const string TopicoCoordenador = "servers";
     private const int ClockPort = 5560;
     private const int ElectionPort = 5561;
+    private const int WritePort = 5562;
+    private const int ReplicationPort = 5563;
     private const int RequestTimeoutMs = 2000;
     private const int AnnouncementTimeoutMs = 3000;
     private const int StartupDelayMs = 200;
@@ -214,10 +216,59 @@ public class ServidorApp
         File.AppendAllText(_publicacoesPath, entry + Environment.NewLine);
     }
 
+    private LoginResponse ErroLogin(string mensagem) => new()
+    {
+        Status = Status.Erro,
+        ErroMsg = mensagem
+    };
+
+    private CreateChannelResponse ErroCreateChannel(string mensagem) => new()
+    {
+        Status = Status.Erro,
+        ErroMsg = mensagem
+    };
+
+    private PublishResponse ErroPublish(string mensagem) => new()
+    {
+        Status = Status.Erro,
+        ErroMsg = mensagem
+    };
+
+    private Envelope EnvelopeResposta(object resposta)
+    {
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
+        var respEnv = new Envelope { Cabecalho = cab };
+
+        if (resposta is LoginResponse lr)
+        {
+            lr.Cabecalho = cab.Clone();
+            respEnv.LoginRes = lr;
+        }
+        else if (resposta is CreateChannelResponse cr)
+        {
+            cr.Cabecalho = cab.Clone();
+            respEnv.CreateChannelRes = cr;
+        }
+        else if (resposta is ListChannelsResponse lcr)
+        {
+            lcr.Cabecalho = cab.Clone();
+            respEnv.ListChannelsRes = lcr;
+        }
+        else if (resposta is PublishResponse pr)
+        {
+            pr.Cabecalho = cab.Clone();
+            respEnv.PublishRes = pr;
+        }
+
+        return respEnv;
+    }
+
     private void IniciarServicosInternos()
     {
         _ = Task.Run(LoopRelogio);
         _ = Task.Run(LoopEleicao);
+        _ = Task.Run(LoopEscritasCoordenador);
+        _ = Task.Run(LoopReplicacao);
         _ = Task.Run(LoopAnunciosCoordenador);
     }
 
@@ -293,6 +344,61 @@ public class ServidorApp
             catch (Exception ex)
             {
                 Console.WriteLine($"[SERVIDOR] Erro no serviço interno de eleição: {ex.Message}");
+            }
+        }
+    }
+
+    private void LoopEscritasCoordenador()
+    {
+        using var sock = new ResponseSocket();
+        sock.Bind($"tcp://*:{WritePort}");
+        Console.WriteLine($"[SERVIDOR] Serviço interno de escrita ouvindo em tcp://*:{WritePort}");
+
+        while (true)
+        {
+            try
+            {
+                var data = sock.ReceiveFrameBytes();
+                var env = Mensageria.EnvelopeFromBytes(data);
+                _relogio.OnReceive(env.Cabecalho.RelogioLogico);
+
+                object resposta = !IsCoordenador()
+                    ? env.ConteudoCase switch
+                    {
+                        Envelope.ConteudoOneofCase.LoginReq => ErroLogin("nao sou coordenador"),
+                        Envelope.ConteudoOneofCase.CreateChannelReq => ErroCreateChannel("nao sou coordenador"),
+                        _ => ErroPublish("nao sou coordenador")
+                    }
+                    : ProcessarEscritaComReplicacao(env);
+
+                sock.SendFrame(EnvelopeResposta(resposta).ToByteArray());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SERVIDOR] Erro no serviço interno de escrita: {ex.Message}");
+            }
+        }
+    }
+
+    private void LoopReplicacao()
+    {
+        using var sock = new ResponseSocket();
+        sock.Bind($"tcp://*:{ReplicationPort}");
+        Console.WriteLine($"[SERVIDOR] Serviço interno de réplica ouvindo em tcp://*:{ReplicationPort}");
+
+        while (true)
+        {
+            try
+            {
+                var data = sock.ReceiveFrameBytes();
+                var env = Mensageria.EnvelopeFromBytes(data);
+                _relogio.OnReceive(env.Cabecalho.RelogioLogico);
+                var resposta = AplicarEscritaLocal(env, origemReplicacao: true);
+                sock.SendFrame(EnvelopeResposta(resposta).ToByteArray());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SERVIDOR] Erro no serviço interno de réplica: {ex.Message}");
             }
         }
     }
@@ -667,6 +773,116 @@ public class ServidorApp
         return true;
     }
 
+    private object EncaminharEscritaAoCoordenador(Envelope env, string operacao)
+    {
+        var coordenador = CoordenadorAtual();
+        if (string.IsNullOrWhiteSpace(coordenador))
+        {
+            ExecutarEleicao("coordenador desconhecido para escrita");
+            coordenador = CoordenadorAtual();
+        }
+
+        if (string.IsNullOrWhiteSpace(coordenador) || coordenador == _serverName)
+        {
+            return operacao switch
+            {
+                "login" => ErroLogin("coordenador indisponivel"),
+                "create_channel" => ErroCreateChannel("coordenador indisponivel"),
+                _ => ErroPublish("coordenador indisponivel")
+            };
+        }
+
+        var reply = EnviarParaServidor(coordenador, WritePort, env, RequestTimeoutMs);
+        if (reply is null)
+        {
+            ExecutarEleicao("falha ao encaminhar escrita");
+            return operacao switch
+            {
+                "login" => ErroLogin("coordenador indisponivel"),
+                "create_channel" => ErroCreateChannel("coordenador indisponivel"),
+                _ => ErroPublish("coordenador indisponivel")
+            };
+        }
+
+        return operacao switch
+        {
+            "login" when reply.Envelope.ConteudoCase == Envelope.ConteudoOneofCase.LoginRes => reply.Envelope.LoginRes,
+            "create_channel" when reply.Envelope.ConteudoCase == Envelope.ConteudoOneofCase.CreateChannelRes => reply.Envelope.CreateChannelRes,
+            "publish" when reply.Envelope.ConteudoCase == Envelope.ConteudoOneofCase.PublishRes => reply.Envelope.PublishRes,
+            "login" => ErroLogin("resposta inesperada do coordenador"),
+            "create_channel" => ErroCreateChannel("resposta inesperada do coordenador"),
+            _ => ErroPublish("resposta inesperada do coordenador")
+        };
+    }
+
+    private object? ReplicarEscrita(Envelope env)
+    {
+        foreach (var servidor in ServidoresAtivosSnapshot())
+        {
+            if (servidor.Nome == _serverName)
+            {
+                continue;
+            }
+
+            var reply = EnviarParaServidor(servidor.Nome, ReplicationPort, env, RequestTimeoutMs);
+            if (reply is null)
+            {
+                return env.ConteudoCase switch
+                {
+                    Envelope.ConteudoOneofCase.LoginReq => ErroLogin($"falha ao replicar em {servidor.Nome}"),
+                    Envelope.ConteudoOneofCase.CreateChannelReq => ErroCreateChannel($"falha ao replicar em {servidor.Nome}"),
+                    _ => ErroPublish($"falha ao replicar em {servidor.Nome}")
+                };
+            }
+
+            switch (reply.Envelope.ConteudoCase)
+            {
+                case Envelope.ConteudoOneofCase.LoginRes when reply.Envelope.LoginRes.Status != Status.Sucesso:
+                    return reply.Envelope.LoginRes;
+                case Envelope.ConteudoOneofCase.CreateChannelRes when reply.Envelope.CreateChannelRes.Status != Status.Sucesso:
+                    return reply.Envelope.CreateChannelRes;
+                case Envelope.ConteudoOneofCase.PublishRes when reply.Envelope.PublishRes.Status != Status.Sucesso:
+                    return reply.Envelope.PublishRes;
+                case Envelope.ConteudoOneofCase.LoginRes:
+                case Envelope.ConteudoOneofCase.CreateChannelRes:
+                case Envelope.ConteudoOneofCase.PublishRes:
+                    break;
+                default:
+                    return env.ConteudoCase switch
+                    {
+                        Envelope.ConteudoOneofCase.LoginReq => ErroLogin("resposta inesperada na replica"),
+                        Envelope.ConteudoOneofCase.CreateChannelReq => ErroCreateChannel("resposta inesperada na replica"),
+                        _ => ErroPublish("resposta inesperada na replica")
+                    };
+            }
+        }
+
+        return null;
+    }
+
+    private object AplicarEscritaLocal(Envelope env, bool origemReplicacao)
+    {
+        return env.ConteudoCase switch
+        {
+            Envelope.ConteudoOneofCase.LoginReq => ProcessarLogin(env.LoginReq),
+            Envelope.ConteudoOneofCase.CreateChannelReq => ProcessarCreateChannel(env.CreateChannelReq, origemReplicacao),
+            Envelope.ConteudoOneofCase.PublishReq => ProcessarPublish(env.PublishReq, env.Cabecalho, publicarNoProxy: !origemReplicacao),
+            _ => ErroPublish("tipo de escrita nao suportado")
+        };
+    }
+
+    private object ProcessarEscritaComReplicacao(Envelope env)
+    {
+        var resposta = AplicarEscritaLocal(env, origemReplicacao: false);
+
+        if (resposta is LoginResponse lr && lr.Status != Status.Sucesso) return lr;
+        if (resposta is CreateChannelResponse cr && cr.Status != Status.Sucesso) return cr;
+        if (resposta is PublishResponse pr && pr.Status != Status.Sucesso) return pr;
+
+        var replicaErro = ReplicarEscrita(env);
+        return replicaErro ?? resposta;
+    }
+
     private bool SincronizarComoSeguidor(string coordenador)
     {
         if (string.IsNullOrWhiteSpace(coordenador))
@@ -857,49 +1073,44 @@ public class ServidorApp
         Console.WriteLine("[SERVIDOR] Aguardando mensagens...");
         while (true)
         {
-            var data = _socket.ReceiveFrameBytes();
-            var env = Mensageria.EnvelopeFromBytes(data);
+            var frames = _socket.ReceiveMultipartBytes();
+            if (frames.Count == 0)
+            {
+                continue;
+            }
+
+            var env = Mensageria.EnvelopeFromBytes(frames[^1]);
             _relogio.OnReceive(env.Cabecalho.RelogioLogico);
             
             Console.WriteLine($"[SERVIDOR] Recebido {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
 
             object? resposta = env.ConteudoCase switch
             {
-                Envelope.ConteudoOneofCase.LoginReq => ProcessarLogin(env.LoginReq),
-                Envelope.ConteudoOneofCase.CreateChannelReq => ProcessarCreateChannel(env.CreateChannelReq),
+                Envelope.ConteudoOneofCase.LoginReq => IsCoordenador()
+                    ? ProcessarEscritaComReplicacao(env)
+                    : EncaminharEscritaAoCoordenador(env, "login"),
+                Envelope.ConteudoOneofCase.CreateChannelReq => IsCoordenador()
+                    ? ProcessarEscritaComReplicacao(env)
+                    : EncaminharEscritaAoCoordenador(env, "create_channel"),
                 Envelope.ConteudoOneofCase.ListChannelsReq => ProcessarListChannels(),
-                Envelope.ConteudoOneofCase.PublishReq => ProcessarPublish(env.PublishReq, env.Cabecalho),
+                Envelope.ConteudoOneofCase.PublishReq => IsCoordenador()
+                    ? ProcessarEscritaComReplicacao(env)
+                    : EncaminharEscritaAoCoordenador(env, "publish"),
                 _ => null
             };
 
             if (resposta == null) continue;
 
-            var cab = Mensageria.NovoCabecalho(_origem, _relogio);
-            var respEnv = new Envelope { Cabecalho = cab };
-            
-            if (resposta is LoginResponse lr)
-            {
-                lr.Cabecalho = cab.Clone();
-                respEnv.LoginRes = lr;
-            }
-            else if (resposta is CreateChannelResponse cr)
-            {
-                cr.Cabecalho = cab.Clone();
-                respEnv.CreateChannelRes = cr;
-            }
-            else if (resposta is ListChannelsResponse lcr)
-            {
-                lcr.Cabecalho = cab.Clone();
-                respEnv.ListChannelsRes = lcr;
-            }
-            else if (resposta is PublishResponse pr)
-            {
-                pr.Cabecalho = cab.Clone();
-                respEnv.PublishRes = pr;
-            }
+            var respEnv = EnvelopeResposta(resposta);
 
             Console.WriteLine($"[SERVIDOR] Enviando {respEnv.ConteudoCase} {Mensageria.CabecalhoTexto(respEnv.Cabecalho)}");
-            _socket.SendFrame(respEnv.ToByteArray());
+            var msg = new NetMQMessage();
+            for (var i = 0; i < frames.Count - 1; i++)
+            {
+                msg.Append(frames[i]);
+            }
+            msg.Append(respEnv.ToByteArray());
+            _socket.SendMultipartMessage(msg);
 
             _requestsProcessadas += 1;
             if (_requestsProcessadas % 10 == 0)
@@ -931,7 +1142,7 @@ public class ServidorApp
         return res;
     }
 
-    private CreateChannelResponse ProcessarCreateChannel(CreateChannelRequest req)
+    private CreateChannelResponse ProcessarCreateChannel(CreateChannelRequest req, bool aceitarExistente)
     {
         var res = new CreateChannelResponse();
         var nome = req.NomeCanal?.Trim();
@@ -946,6 +1157,11 @@ public class ServidorApp
         var canais = LerCanais();
         if (canais.Contains(nome))
         {
+            if (aceitarExistente)
+            {
+                res.Status = Status.Sucesso;
+                return res;
+            }
             res.Status = Status.Erro;
             res.ErroMsg = "canal já existe";
             return res;
@@ -964,7 +1180,7 @@ public class ServidorApp
         return res;
     }
 
-    private PublishResponse ProcessarPublish(PublishRequest req, Cabecalho envCabecalho)
+    private PublishResponse ProcessarPublish(PublishRequest req, Cabecalho envCabecalho, bool publicarNoProxy)
     {
         var res = new PublishResponse();
         var canal = req.Canal?.Trim() ?? "";
@@ -991,7 +1207,9 @@ public class ServidorApp
             return res;
         }
 
-        var remetente = string.IsNullOrWhiteSpace(envCabecalho.LinguagemOrigem) ? "desconhecido" : envCabecalho.LinguagemOrigem;
+        var remetente = string.IsNullOrWhiteSpace(req.Cabecalho?.LinguagemOrigem)
+            ? (string.IsNullOrWhiteSpace(envCabecalho.LinguagemOrigem) ? "desconhecido" : envCabecalho.LinguagemOrigem)
+            : req.Cabecalho.LinguagemOrigem;
         var cabPub = Mensageria.NovoCabecalho(_origem, _relogio);
         var channelMsg = new ChannelMessage
         {
@@ -1002,10 +1220,13 @@ public class ServidorApp
             RelogioLogico = cabPub.RelogioLogico
         };
 
-        Console.WriteLine($"[SERVIDOR] Publicando em {canal} ts={Mensageria.TimestampTexto(channelMsg.TimestampEnvio)} relogio={channelMsg.RelogioLogico}");
-        _pubSocket.SendMoreFrame(canal).SendFrame(channelMsg.ToByteArray());
+        if (publicarNoProxy)
+        {
+            Console.WriteLine($"[SERVIDOR] Publicando em {canal} ts={Mensageria.TimestampTexto(channelMsg.TimestampEnvio)} relogio={channelMsg.RelogioLogico}");
+            _pubSocket.SendMoreFrame(canal).SendFrame(channelMsg.ToByteArray());
+        }
 
-        RegistrarPublicacao(canal, mensagem, remetente, Mensageria.TimestampTexto(channelMsg.TimestampEnvio));
+        RegistrarPublicacao(canal, mensagem, remetente, Mensageria.TimestampTexto(req.Cabecalho.TimestampEnvio));
 
         res.Status = Status.Sucesso;
         return res;

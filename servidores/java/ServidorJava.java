@@ -20,6 +20,8 @@ public class ServidorJava {
   private static final String TOPICO_COORDENADOR = "servers";
   private static final int CLOCK_PORT = 5560;
   private static final int ELECTION_PORT = 5561;
+  private static final int WRITE_PORT = 5562;
+  private static final int REPLICATION_PORT = 5563;
   private static final int REQUEST_TIMEOUT_MS = 2000;
   private static final int ANNOUNCEMENT_TIMEOUT_MS = 3000;
   private static final int STARTUP_DELAY_MS = 200;
@@ -279,6 +281,44 @@ public class ServidorJava {
     }
   }
 
+  private Contrato.LoginResponse erroLogin(String mensagem) {
+    return Contrato.LoginResponse.newBuilder()
+        .setStatus(Contrato.Status.STATUS_ERRO)
+        .setErroMsg(mensagem)
+        .build();
+  }
+
+  private Contrato.CreateChannelResponse erroCreateChannel(String mensagem) {
+    return Contrato.CreateChannelResponse.newBuilder()
+        .setStatus(Contrato.Status.STATUS_ERRO)
+        .setErroMsg(mensagem)
+        .build();
+  }
+
+  private Contrato.PublishResponse erroPublish(String mensagem) {
+    return Contrato.PublishResponse.newBuilder()
+        .setStatus(Contrato.Status.STATUS_ERRO)
+        .setErroMsg(mensagem)
+        .build();
+  }
+
+  private Contrato.Envelope envelopeResposta(Object resposta) {
+    Contrato.Cabecalho outerCab = Mensageria.novoCabecalho(origem, relogio);
+    Contrato.Envelope.Builder respEnv = Contrato.Envelope.newBuilder().setCabecalho(outerCab);
+
+    if (resposta instanceof Contrato.LoginResponse lr) {
+      respEnv.setLoginRes(lr.toBuilder().setCabecalho(outerCab).build());
+    } else if (resposta instanceof Contrato.CreateChannelResponse cr) {
+      respEnv.setCreateChannelRes(cr.toBuilder().setCabecalho(outerCab).build());
+    } else if (resposta instanceof Contrato.ListChannelsResponse lcr) {
+      respEnv.setListChannelsRes(lcr.toBuilder().setCabecalho(outerCab).build());
+    } else if (resposta instanceof Contrato.PublishResponse pr) {
+      respEnv.setPublishRes(pr.toBuilder().setCabecalho(outerCab).build());
+    }
+
+    return respEnv.build();
+  }
+
   private Contrato.LoginResponse processarLogin(Contrato.LoginRequest req) {
     Contrato.LoginResponse.Builder res = Contrato.LoginResponse.newBuilder();
 
@@ -294,7 +334,10 @@ public class ServidorJava {
     return res.build();
   }
 
-  private Contrato.CreateChannelResponse processarCreateChannel(Contrato.CreateChannelRequest req) {
+  private Contrato.CreateChannelResponse processarCreateChannel(
+      Contrato.CreateChannelRequest req,
+      boolean aceitarExistente
+  ) {
     Contrato.CreateChannelResponse.Builder res = Contrato.CreateChannelResponse.newBuilder();
 
     String nome = req.getNomeCanal().trim();
@@ -307,6 +350,10 @@ public class ServidorJava {
     List<String> canais = lerCanais();
     for (String c : canais) {
       if (c.equals(nome)) {
+        if (aceitarExistente) {
+          res.setStatus(Contrato.Status.STATUS_SUCESSO);
+          return res.build();
+        }
         res.setStatus(Contrato.Status.STATUS_ERRO);
         res.setErroMsg("canal já existe");
         return res.build();
@@ -328,7 +375,8 @@ public class ServidorJava {
 
   private Contrato.PublishResponse processarPublish(
       Contrato.PublishRequest req,
-      Contrato.Cabecalho envelopeCabecalho
+      Contrato.Cabecalho envelopeCabecalho,
+      boolean publicarNoProxy
   ) {
     Contrato.PublishResponse.Builder res = Contrato.PublishResponse.newBuilder();
 
@@ -352,9 +400,12 @@ public class ServidorJava {
       return res.build();
     }
 
-    String remetente = envelopeCabecalho.getLinguagemOrigem().isBlank()
-        ? "desconhecido"
-        : envelopeCabecalho.getLinguagemOrigem();
+    String remetente = req.getCabecalho().getLinguagemOrigem();
+    if (remetente.isBlank()) {
+      remetente = envelopeCabecalho.getLinguagemOrigem().isBlank()
+          ? "desconhecido"
+          : envelopeCabecalho.getLinguagemOrigem();
+    }
 
     Contrato.Cabecalho cabPub = Mensageria.novoCabecalho(origem, relogio);
     Contrato.ChannelMessage channelMessage = Contrato.ChannelMessage.newBuilder()
@@ -365,15 +416,17 @@ public class ServidorJava {
         .setRelogioLogico(cabPub.getRelogioLogico())
         .build();
 
-    System.out.println(
-        "[SERVIDOR] Publicando em " + canal
-            + " ts=" + Mensageria.timestampTexto(channelMessage.getTimestampEnvio())
-            + " relogio=" + channelMessage.getRelogioLogico()
-    );
-    pubSocket.sendMore(canal.getBytes(StandardCharsets.UTF_8));
-    pubSocket.send(channelMessage.toByteArray(), 0);
+    if (publicarNoProxy) {
+      System.out.println(
+          "[SERVIDOR] Publicando em " + canal
+              + " ts=" + Mensageria.timestampTexto(channelMessage.getTimestampEnvio())
+              + " relogio=" + channelMessage.getRelogioLogico()
+      );
+      pubSocket.sendMore(canal.getBytes(StandardCharsets.UTF_8));
+      pubSocket.send(channelMessage.toByteArray(), 0);
+    }
 
-    registrarPublicacao(canal, mensagem, remetente, Mensageria.timestampTexto(channelMessage.getTimestampEnvio()));
+    registrarPublicacao(canal, mensagem, remetente, Mensageria.timestampTexto(req.getCabecalho().getTimestampEnvio()));
 
     res.setStatus(Contrato.Status.STATUS_SUCESSO);
     return res.build();
@@ -387,6 +440,14 @@ public class ServidorJava {
     Thread electionThread = new Thread(this::loopEleicao, "servidor-java-election");
     electionThread.setDaemon(true);
     electionThread.start();
+
+    Thread writeThread = new Thread(this::loopEscritasCoordenador, "servidor-java-write");
+    writeThread.setDaemon(true);
+    writeThread.start();
+
+    Thread replicationThread = new Thread(this::loopReplicacao, "servidor-java-replication");
+    replicationThread.setDaemon(true);
+    replicationThread.start();
 
     Thread announcementThread = new Thread(this::loopAnunciosCoordenador, "servidor-java-announcements");
     announcementThread.setDaemon(true);
@@ -472,6 +533,69 @@ public class ServidorJava {
       }
     } catch (Exception e) {
       System.out.println("[SERVIDOR] Erro no serviço interno de eleição: " + e.getMessage());
+    }
+  }
+
+  private void loopEscritasCoordenador() {
+    try (ZMQ.Socket sock = context.socket(ZMQ.REP)) {
+      sock.bind("tcp://*:" + WRITE_PORT);
+      System.out.println("[SERVIDOR] Serviço interno de escrita ouvindo em tcp://*:" + WRITE_PORT);
+      while (true) {
+        byte[] data = sock.recv(0);
+        if (data == null) {
+          continue;
+        }
+
+        Contrato.Envelope env;
+        try {
+          env = Contrato.Envelope.parseFrom(data);
+        } catch (Exception e) {
+          System.out.println("[SERVIDOR] Envelope inválido na escrita interna: " + e.getMessage());
+          continue;
+        }
+
+        relogio.onReceive(env.getCabecalho().getRelogioLogico());
+        Object resposta;
+        if (!isCoordenador()) {
+          resposta = switch (env.getConteudoCase()) {
+            case LOGIN_REQ -> erroLogin("nao sou coordenador");
+            case CREATE_CHANNEL_REQ -> erroCreateChannel("nao sou coordenador");
+            default -> erroPublish("nao sou coordenador");
+          };
+        } else {
+          resposta = processarEscritaComReplicacao(env);
+        }
+        sock.send(envelopeResposta(resposta).toByteArray(), 0);
+      }
+    } catch (Exception e) {
+      System.out.println("[SERVIDOR] Erro no serviço interno de escrita: " + e.getMessage());
+    }
+  }
+
+  private void loopReplicacao() {
+    try (ZMQ.Socket sock = context.socket(ZMQ.REP)) {
+      sock.bind("tcp://*:" + REPLICATION_PORT);
+      System.out.println("[SERVIDOR] Serviço interno de réplica ouvindo em tcp://*:" + REPLICATION_PORT);
+      while (true) {
+        byte[] data = sock.recv(0);
+        if (data == null) {
+          continue;
+        }
+
+        Contrato.Envelope env;
+        try {
+          env = Contrato.Envelope.parseFrom(data);
+        } catch (Exception e) {
+          System.out.println("[SERVIDOR] Envelope inválido na réplica interna: " + e.getMessage());
+          continue;
+        }
+
+        relogio.onReceive(env.getCabecalho().getRelogioLogico());
+        Object resposta = aplicarEscritaLocal(env, true);
+        sock.send(envelopeResposta(resposta).toByteArray(), 0);
+      }
+    } catch (Exception e) {
+      System.out.println("[SERVIDOR] Erro no serviço interno de réplica: " + e.getMessage());
     }
   }
 
@@ -788,6 +912,109 @@ public class ServidorJava {
     return true;
   }
 
+  private Object encaminharEscritaAoCoordenador(Contrato.Envelope env, String operacao) {
+    String coordenador = coordenadorAtual();
+    if (coordenador.isBlank()) {
+      executarEleicao("coordenador desconhecido para escrita");
+      coordenador = coordenadorAtual();
+    }
+    if (coordenador.isBlank() || coordenador.equals(serverName)) {
+      return switch (operacao) {
+        case "login" -> erroLogin("coordenador indisponivel");
+        case "create_channel" -> erroCreateChannel("coordenador indisponivel");
+        default -> erroPublish("coordenador indisponivel");
+      };
+    }
+
+    PeerReply reply = enviarParaServidor(coordenador, WRITE_PORT, env, REQUEST_TIMEOUT_MS);
+    if (reply == null) {
+      executarEleicao("falha ao encaminhar escrita");
+      return switch (operacao) {
+        case "login" -> erroLogin("coordenador indisponivel");
+        case "create_channel" -> erroCreateChannel("coordenador indisponivel");
+        default -> erroPublish("coordenador indisponivel");
+      };
+    }
+
+    return switch (operacao) {
+      case "login" -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.LOGIN_RES
+          ? reply.envelope.getLoginRes()
+          : erroLogin("resposta inesperada do coordenador");
+      case "create_channel" -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.CREATE_CHANNEL_RES
+          ? reply.envelope.getCreateChannelRes()
+          : erroCreateChannel("resposta inesperada do coordenador");
+      default -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.PUBLISH_RES
+          ? reply.envelope.getPublishRes()
+          : erroPublish("resposta inesperada do coordenador");
+    };
+  }
+
+  private Object replicarEscrita(Contrato.Envelope env) {
+    for (Contrato.ServerInfo servidor : servidoresAtivosSnapshot()) {
+      if (servidor.getNome().equals(serverName)) {
+        continue;
+      }
+      PeerReply reply = enviarParaServidor(servidor.getNome(), REPLICATION_PORT, env, REQUEST_TIMEOUT_MS);
+      if (reply == null) {
+        return switch (env.getConteudoCase()) {
+          case LOGIN_REQ -> erroLogin("falha ao replicar em " + servidor.getNome());
+          case CREATE_CHANNEL_REQ -> erroCreateChannel("falha ao replicar em " + servidor.getNome());
+          default -> erroPublish("falha ao replicar em " + servidor.getNome());
+        };
+      }
+      switch (reply.envelope.getConteudoCase()) {
+        case LOGIN_RES -> {
+          if (reply.envelope.getLoginRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
+            return reply.envelope.getLoginRes();
+          }
+        }
+        case CREATE_CHANNEL_RES -> {
+          if (reply.envelope.getCreateChannelRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
+            return reply.envelope.getCreateChannelRes();
+          }
+        }
+        case PUBLISH_RES -> {
+          if (reply.envelope.getPublishRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
+            return reply.envelope.getPublishRes();
+          }
+        }
+        default -> {
+          return switch (env.getConteudoCase()) {
+            case LOGIN_REQ -> erroLogin("resposta inesperada na replica");
+            case CREATE_CHANNEL_REQ -> erroCreateChannel("resposta inesperada na replica");
+            default -> erroPublish("resposta inesperada na replica");
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  private Object aplicarEscritaLocal(Contrato.Envelope env, boolean origemReplicacao) {
+    return switch (env.getConteudoCase()) {
+      case LOGIN_REQ -> processarLogin(env.getLoginReq());
+      case CREATE_CHANNEL_REQ -> processarCreateChannel(env.getCreateChannelReq(), origemReplicacao);
+      case PUBLISH_REQ -> processarPublish(env.getPublishReq(), env.getCabecalho(), !origemReplicacao);
+      default -> erroPublish("tipo de escrita nao suportado");
+    };
+  }
+
+  private Object processarEscritaComReplicacao(Contrato.Envelope env) {
+    Object resposta = aplicarEscritaLocal(env, false);
+    if (resposta instanceof Contrato.LoginResponse lr && lr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
+      return lr;
+    }
+    if (resposta instanceof Contrato.CreateChannelResponse cr && cr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
+      return cr;
+    }
+    if (resposta instanceof Contrato.PublishResponse pr && pr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
+      return pr;
+    }
+
+    Object replicaErro = replicarEscrita(env);
+    return replicaErro == null ? resposta : replicaErro;
+  }
+
   private boolean sincronizarComoSeguidor(String coordenador) {
     if (coordenador == null || coordenador.isBlank()) {
       return false;
@@ -970,14 +1197,23 @@ public class ServidorJava {
   public void loop() throws Exception {
     System.out.println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...");
     while (true) {
-      byte[] data = socket.recv(0);
-      if (data == null) {
+      List<byte[]> frames = new ArrayList<>();
+      byte[] first = socket.recv(0);
+      if (first == null) {
         continue;
+      }
+      frames.add(first);
+      while (socket.hasReceiveMore()) {
+        byte[] next = socket.recv(0);
+        if (next == null) {
+          break;
+        }
+        frames.add(next);
       }
 
       Contrato.Envelope env;
       try {
-        env = Contrato.Envelope.parseFrom(data);
+        env = Contrato.Envelope.parseFrom(frames.get(frames.size() - 1));
       } catch (Exception e) {
         System.err.println("[SERVIDOR] Envelope invalido: " + e.getMessage());
         continue;
@@ -988,10 +1224,16 @@ public class ServidorJava {
       System.out.println("[SERVIDOR] Recebido " + tipo + " " + Mensageria.cabecalhoTexto(env.getCabecalho()));
 
       Object resposta = switch (tipo) {
-        case LOGIN_REQ -> processarLogin(env.getLoginReq());
-        case CREATE_CHANNEL_REQ -> processarCreateChannel(env.getCreateChannelReq());
+        case LOGIN_REQ -> isCoordenador()
+            ? processarEscritaComReplicacao(env)
+            : encaminharEscritaAoCoordenador(env, "login");
+        case CREATE_CHANNEL_REQ -> isCoordenador()
+            ? processarEscritaComReplicacao(env)
+            : encaminharEscritaAoCoordenador(env, "create_channel");
         case LIST_CHANNELS_REQ -> processarListChannels();
-        case PUBLISH_REQ -> processarPublish(env.getPublishReq(), env.getCabecalho());
+        case PUBLISH_REQ -> isCoordenador()
+            ? processarEscritaComReplicacao(env)
+            : encaminharEscritaAoCoordenador(env, "publish");
         default -> null;
       };
 
@@ -1000,21 +1242,12 @@ public class ServidorJava {
         continue;
       }
 
-      Contrato.Cabecalho outerCab = Mensageria.novoCabecalho(origem, relogio);
-      Contrato.Envelope.Builder respEnv = Contrato.Envelope.newBuilder().setCabecalho(outerCab);
-
-      if (resposta instanceof Contrato.LoginResponse lr) {
-        respEnv.setLoginRes(lr.toBuilder().setCabecalho(outerCab).build());
-      } else if (resposta instanceof Contrato.CreateChannelResponse cr) {
-        respEnv.setCreateChannelRes(cr.toBuilder().setCabecalho(outerCab).build());
-      } else if (resposta instanceof Contrato.ListChannelsResponse lcr) {
-        respEnv.setListChannelsRes(lcr.toBuilder().setCabecalho(outerCab).build());
-      } else if (resposta instanceof Contrato.PublishResponse pr) {
-        respEnv.setPublishRes(pr.toBuilder().setCabecalho(outerCab).build());
+      Contrato.Envelope respEnv = envelopeResposta(resposta);
+      System.out.println("[SERVIDOR] Enviando " + respEnv.getConteudoCase() + " " + Mensageria.cabecalhoTexto(respEnv.getCabecalho()));
+      for (int i = 0; i < frames.size() - 1; i++) {
+        socket.sendMore(frames.get(i));
       }
-
-      System.out.println("[SERVIDOR] Enviando " + respEnv.getConteudoCase() + " " + Mensageria.cabecalhoTexto(outerCab));
-      socket.send(Mensageria.envelopeBytes(respEnv.build()), 0);
+      socket.send(Mensageria.envelopeBytes(respEnv), 0);
 
       requestsProcessadas += 1;
       if (requestsProcessadas % 10 == 0) {

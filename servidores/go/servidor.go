@@ -27,6 +27,8 @@ const (
 	dataDirDefault     = "/data"
 	clockPort          = 5560
 	electionPort       = 5561
+	writePort          = 5562
+	replicationPort    = 5563
 	requestTimeout     = 2 * time.Second
 	announcementDelay  = 3 * time.Second
 	startupDelay       = 200 * time.Millisecond
@@ -204,6 +206,38 @@ func conteudoNome(env *protos.Envelope) string {
 	default:
 		return "desconhecido"
 	}
+}
+
+func erroLogin(msg string) *protos.LoginResponse {
+	return &protos.LoginResponse{Status: protos.Status_STATUS_ERRO, ErroMsg: msg}
+}
+
+func erroCreateChannel(msg string) *protos.CreateChannelResponse {
+	return &protos.CreateChannelResponse{Status: protos.Status_STATUS_ERRO, ErroMsg: msg}
+}
+
+func erroPublish(msg string) *protos.PublishResponse {
+	return &protos.PublishResponse{Status: protos.Status_STATUS_ERRO, ErroMsg: msg}
+}
+
+func (s *Servidor) envelopeResposta(resp proto.Message) *protos.Envelope {
+	cab := mensageria.NovoCabecalho(s.origem, s.clock)
+	respEnv := &protos.Envelope{Cabecalho: cab}
+	switch r := resp.(type) {
+	case *protos.LoginResponse:
+		r.Cabecalho = cab
+		respEnv.Conteudo = &protos.Envelope_LoginRes{LoginRes: r}
+	case *protos.CreateChannelResponse:
+		r.Cabecalho = cab
+		respEnv.Conteudo = &protos.Envelope_CreateChannelRes{CreateChannelRes: r}
+	case *protos.ListChannelsResponse:
+		r.Cabecalho = cab
+		respEnv.Conteudo = &protos.Envelope_ListChannelsRes{ListChannelsRes: r}
+	case *protos.PublishResponse:
+		r.Cabecalho = cab
+		respEnv.Conteudo = &protos.Envelope_PublishRes{PublishRes: r}
+	}
+	return respEnv
 }
 
 func (s *Servidor) initStorage() {
@@ -388,13 +422,16 @@ func (s *Servidor) registrarPublicacao(canal, mensagem, remetente, timestampISO 
 func (s *Servidor) loop() {
 	log.Println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
 	for {
-		data, err := s.sock.RecvBytes(0)
+		frames, err := s.sock.RecvMessageBytes(0)
 		if err != nil {
 			log.Printf("[SERVIDOR] Recv: %v", err)
 			continue
 		}
+		if len(frames) == 0 {
+			continue
+		}
 		env := &protos.Envelope{}
-		if err := proto.Unmarshal(data, env); err != nil {
+		if err := proto.Unmarshal(frames[len(frames)-1], env); err != nil {
 			log.Printf("[SERVIDOR] Envelope inválido: %v", err)
 			continue
 		}
@@ -410,37 +447,39 @@ func (s *Servidor) loop() {
 		var resp proto.Message
 		switch c := conteudo.(type) {
 		case *protos.Envelope_LoginReq:
-			resp = s.processarLogin(c.LoginReq)
+			if !s.isCoordenador() {
+				resp = s.encaminharEscritaAoCoordenador(env, "login")
+			} else {
+				resp = s.processarEscritaComReplicacao(env)
+			}
 		case *protos.Envelope_CreateChannelReq:
-			resp = s.processarCreateChannel(c.CreateChannelReq)
+			if !s.isCoordenador() {
+				resp = s.encaminharEscritaAoCoordenador(env, "create_channel")
+			} else {
+				resp = s.processarEscritaComReplicacao(env)
+			}
 		case *protos.Envelope_ListChannelsReq:
 			resp = s.processarListChannels(c.ListChannelsReq)
 		case *protos.Envelope_PublishReq:
-			resp = s.processarPublish(c.PublishReq, env.GetCabecalho())
+			if !s.isCoordenador() {
+				resp = s.encaminharEscritaAoCoordenador(env, "publish")
+			} else {
+				resp = s.processarEscritaComReplicacao(env)
+			}
 		default:
 			log.Printf("[SERVIDOR] Tipo de mensagem não suportado: %T", conteudo)
 			continue
 		}
 
-		cab := mensageria.NovoCabecalho(s.origem, s.clock)
-		respEnv := &protos.Envelope{Cabecalho: cab}
-		switch r := resp.(type) {
-		case *protos.LoginResponse:
-			r.Cabecalho = cab
-			respEnv.Conteudo = &protos.Envelope_LoginRes{LoginRes: r}
-		case *protos.CreateChannelResponse:
-			r.Cabecalho = cab
-			respEnv.Conteudo = &protos.Envelope_CreateChannelRes{CreateChannelRes: r}
-		case *protos.ListChannelsResponse:
-			r.Cabecalho = cab
-			respEnv.Conteudo = &protos.Envelope_ListChannelsRes{ListChannelsRes: r}
-		case *protos.PublishResponse:
-			r.Cabecalho = cab
-			respEnv.Conteudo = &protos.Envelope_PublishRes{PublishRes: r}
-		}
+		respEnv := s.envelopeResposta(resp)
 		respData, _ := proto.Marshal(respEnv)
 		log.Printf("[SERVIDOR] Enviando %s %s", conteudoNome(respEnv), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
-		if _, err := s.sock.SendBytes(respData, 0); err != nil {
+		out := make([]interface{}, 0, len(frames))
+		for _, frame := range frames[:len(frames)-1] {
+			out = append(out, frame)
+		}
+		out = append(out, respData)
+		if _, err := s.sock.SendMessage(out...); err != nil {
 			log.Printf("[SERVIDOR] Send: %v", err)
 			continue
 		}
@@ -458,6 +497,8 @@ func (s *Servidor) loop() {
 func (s *Servidor) iniciarServicosInternos() {
 	go s.loopRelogio()
 	go s.loopEleicao()
+	go s.loopEscritasCoordenador()
+	go s.loopReplicacao()
 	go s.loopAnunciosCoordenador()
 }
 
@@ -499,8 +540,8 @@ func (s *Servidor) loopRelogio() {
 			resposta = s.processarPedidoRelogio(c.HeartbeatReq)
 		default:
 			resposta = &protos.HeartbeatResponse{
-				Status:   protos.Status_STATUS_ERRO,
-				ErroMsg:  fmt.Sprintf("tipo não suportado: %T", c),
+				Status:    protos.Status_STATUS_ERRO,
+				ErroMsg:   fmt.Sprintf("tipo não suportado: %T", c),
 				Cabecalho: nil,
 			}
 		}
@@ -552,6 +593,66 @@ func (s *Servidor) loopEleicao() {
 		payload, _ := mensageria.EnvelopeBytes(respostaEnv)
 		if _, err := sock.SendBytes(payload, 0); err != nil {
 			log.Printf("[SERVIDOR] Falha ao responder eleição interna: %v", err)
+		}
+	}
+}
+
+func (s *Servidor) loopEscritasCoordenador() {
+	sock := mustBindReplySocket(writePort)
+	defer sock.Close()
+	log.Printf("[SERVIDOR] Serviço interno de escrita ouvindo em tcp://*:%d", writePort)
+	for {
+		data, err := sock.RecvBytes(0)
+		if err != nil {
+			log.Printf("[SERVIDOR] Erro no serviço interno de escrita: %v", err)
+			continue
+		}
+		env, err := mensageria.EnvelopeFromBytes(data)
+		if err != nil {
+			log.Printf("[SERVIDOR] Envelope inválido na escrita interna: %v", err)
+			continue
+		}
+		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+		var resp proto.Message
+		if !s.isCoordenador() {
+			switch env.GetConteudo().(type) {
+			case *protos.Envelope_LoginReq:
+				resp = erroLogin("nao sou coordenador")
+			case *protos.Envelope_CreateChannelReq:
+				resp = erroCreateChannel("nao sou coordenador")
+			default:
+				resp = erroPublish("nao sou coordenador")
+			}
+		} else {
+			resp = s.processarEscritaComReplicacao(env)
+		}
+		payload, _ := mensageria.EnvelopeBytes(s.envelopeResposta(resp))
+		if _, err := sock.SendBytes(payload, 0); err != nil {
+			log.Printf("[SERVIDOR] Falha ao responder escrita interna: %v", err)
+		}
+	}
+}
+
+func (s *Servidor) loopReplicacao() {
+	sock := mustBindReplySocket(replicationPort)
+	defer sock.Close()
+	log.Printf("[SERVIDOR] Serviço interno de réplica ouvindo em tcp://*:%d", replicationPort)
+	for {
+		data, err := sock.RecvBytes(0)
+		if err != nil {
+			log.Printf("[SERVIDOR] Erro no serviço interno de réplica: %v", err)
+			continue
+		}
+		env, err := mensageria.EnvelopeFromBytes(data)
+		if err != nil {
+			log.Printf("[SERVIDOR] Envelope inválido na réplica interna: %v", err)
+			continue
+		}
+		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+		resp := s.aplicarEscritaLocal(env, true)
+		payload, _ := mensageria.EnvelopeBytes(s.envelopeResposta(resp))
+		if _, err := sock.SendBytes(payload, 0); err != nil {
+			log.Printf("[SERVIDOR] Falha ao responder réplica interna: %v", err)
 		}
 	}
 }
@@ -861,6 +962,129 @@ func (s *Servidor) consultarEleicaoServidor(nomeServidor string) bool {
 	return true
 }
 
+func (s *Servidor) encaminharEscritaAoCoordenador(env *protos.Envelope, operacao string) proto.Message {
+	coordenador := s.coordenadorAtual()
+	if coordenador == "" {
+		s.executarEleicao("coordenador desconhecido para escrita")
+		coordenador = s.coordenadorAtual()
+	}
+	if coordenador == "" || coordenador == s.serverName {
+		if operacao == "login" {
+			return erroLogin("coordenador indisponivel")
+		}
+		if operacao == "create_channel" {
+			return erroCreateChannel("coordenador indisponivel")
+		}
+		return erroPublish("coordenador indisponivel")
+	}
+	resp, _, _, err := s.enviarParaServidor(coordenador, writePort, env, requestTimeout)
+	if err != nil || resp == nil {
+		s.executarEleicao("falha ao encaminhar escrita")
+		if operacao == "login" {
+			return erroLogin("coordenador indisponivel")
+		}
+		if operacao == "create_channel" {
+			return erroCreateChannel("coordenador indisponivel")
+		}
+		return erroPublish("coordenador indisponivel")
+	}
+	switch operacao {
+	case "login":
+		if r, ok := resp.GetConteudo().(*protos.Envelope_LoginRes); ok {
+			return r.LoginRes
+		}
+		return erroLogin("resposta inesperada do coordenador")
+	case "create_channel":
+		if r, ok := resp.GetConteudo().(*protos.Envelope_CreateChannelRes); ok {
+			return r.CreateChannelRes
+		}
+		return erroCreateChannel("resposta inesperada do coordenador")
+	default:
+		if r, ok := resp.GetConteudo().(*protos.Envelope_PublishRes); ok {
+			return r.PublishRes
+		}
+		return erroPublish("resposta inesperada do coordenador")
+	}
+}
+
+func (s *Servidor) replicarEscrita(env *protos.Envelope) proto.Message {
+	for _, item := range s.servidoresAtivosSnapshot() {
+		if item.GetNome() == s.serverName {
+			continue
+		}
+		resp, _, _, err := s.enviarParaServidor(item.GetNome(), replicationPort, env, requestTimeout)
+		if err != nil || resp == nil {
+			switch env.GetConteudo().(type) {
+			case *protos.Envelope_LoginReq:
+				return erroLogin(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
+			case *protos.Envelope_CreateChannelReq:
+				return erroCreateChannel(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
+			default:
+				return erroPublish(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
+			}
+		}
+		switch c := resp.GetConteudo().(type) {
+		case *protos.Envelope_LoginRes:
+			if c.LoginRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return c.LoginRes
+			}
+		case *protos.Envelope_CreateChannelRes:
+			if c.CreateChannelRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return c.CreateChannelRes
+			}
+		case *protos.Envelope_PublishRes:
+			if c.PublishRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return c.PublishRes
+			}
+		default:
+			switch env.GetConteudo().(type) {
+			case *protos.Envelope_LoginReq:
+				return erroLogin("resposta inesperada na replica")
+			case *protos.Envelope_CreateChannelReq:
+				return erroCreateChannel("resposta inesperada na replica")
+			default:
+				return erroPublish("resposta inesperada na replica")
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Servidor) aplicarEscritaLocal(env *protos.Envelope, origemReplicacao bool) proto.Message {
+	switch c := env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		return s.processarLogin(c.LoginReq)
+	case *protos.Envelope_CreateChannelReq:
+		return s.processarCreateChannel(c.CreateChannelReq, origemReplicacao)
+	case *protos.Envelope_PublishReq:
+		return s.processarPublish(c.PublishReq, env.GetCabecalho(), !origemReplicacao)
+	default:
+		return erroPublish("tipo de escrita nao suportado")
+	}
+}
+
+func (s *Servidor) processarEscritaComReplicacao(env *protos.Envelope) proto.Message {
+	resp := s.aplicarEscritaLocal(env, false)
+	switch r := resp.(type) {
+	case *protos.LoginResponse:
+		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+			return r
+		}
+	case *protos.CreateChannelResponse:
+		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+			return r
+		}
+	case *protos.PublishResponse:
+		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+			return r
+		}
+	}
+	if replicaErr := s.replicarEscrita(env); replicaErr != nil {
+		return replicaErr
+	}
+	return resp
+}
+
 func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
 	if coordenador == "" {
 		return false
@@ -1047,7 +1271,7 @@ func (s *Servidor) processarLogin(req *protos.LoginRequest) *protos.LoginRespons
 	return res
 }
 
-func (s *Servidor) processarCreateChannel(req *protos.CreateChannelRequest) *protos.CreateChannelResponse {
+func (s *Servidor) processarCreateChannel(req *protos.CreateChannelRequest, aceitarExistente bool) *protos.CreateChannelResponse {
 	res := &protos.CreateChannelResponse{}
 	nome := strings.TrimSpace(req.GetNomeCanal())
 	if nome == "" {
@@ -1058,6 +1282,10 @@ func (s *Servidor) processarCreateChannel(req *protos.CreateChannelRequest) *pro
 	canais := s.lerCanais()
 	for _, c := range canais {
 		if c == nome {
+			if aceitarExistente {
+				res.Status = protos.Status_STATUS_SUCESSO
+				return res
+			}
 			res.Status = protos.Status_STATUS_ERRO
 			res.ErroMsg = "canal já existe"
 			return res
@@ -1078,6 +1306,7 @@ func (s *Servidor) processarListChannels(_ *protos.ListChannelsRequest) *protos.
 func (s *Servidor) processarPublish(
 	req *protos.PublishRequest,
 	envCabecalho *protos.Cabecalho,
+	publicarNoProxy bool,
 ) *protos.PublishResponse {
 	res := &protos.PublishResponse{}
 	canal := strings.TrimSpace(req.GetCanal())
@@ -1107,9 +1336,12 @@ func (s *Servidor) processarPublish(
 		return res
 	}
 
-	remetente := "desconhecido"
-	if envCabecalho != nil && envCabecalho.GetLinguagemOrigem() != "" {
+	remetente := req.GetCabecalho().GetLinguagemOrigem()
+	if remetente == "" && envCabecalho != nil && envCabecalho.GetLinguagemOrigem() != "" {
 		remetente = envCabecalho.GetLinguagemOrigem()
+	}
+	if remetente == "" {
+		remetente = "desconhecido"
 	}
 	cabPub := mensageria.NovoCabecalho(s.origem, s.clock)
 	channelMsg := &protos.ChannelMessage{
@@ -1119,25 +1351,27 @@ func (s *Servidor) processarPublish(
 		TimestampEnvio: cabPub.GetTimestampEnvio(),
 		RelogioLogico:  cabPub.GetRelogioLogico(),
 	}
-	payload, err := proto.Marshal(channelMsg)
-	if err != nil {
-		res.Status = protos.Status_STATUS_ERRO
-		res.ErroMsg = "erro ao serializar publicacao"
-		return res
-	}
-	log.Printf(
-		"[SERVIDOR] Publicando em %s ts=%s relogio=%d",
-		canal,
-		mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()),
-		channelMsg.GetRelogioLogico(),
-	)
-	if _, err := s.pubSock.SendMessage([]byte(canal), payload); err != nil {
-		res.Status = protos.Status_STATUS_ERRO
-		res.ErroMsg = "erro ao publicar mensagem"
-		return res
+	if publicarNoProxy {
+		payload, err := proto.Marshal(channelMsg)
+		if err != nil {
+			res.Status = protos.Status_STATUS_ERRO
+			res.ErroMsg = "erro ao serializar publicacao"
+			return res
+		}
+		log.Printf(
+			"[SERVIDOR] Publicando em %s ts=%s relogio=%d",
+			canal,
+			mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()),
+			channelMsg.GetRelogioLogico(),
+		)
+		if _, err := s.pubSock.SendMessage([]byte(canal), payload); err != nil {
+			res.Status = protos.Status_STATUS_ERRO
+			res.ErroMsg = "erro ao publicar mensagem"
+			return res
+		}
 	}
 
-	s.registrarPublicacao(canal, mensagem, remetente, mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()))
+	s.registrarPublicacao(canal, mensagem, remetente, mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()))
 
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res
