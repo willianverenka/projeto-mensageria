@@ -9,10 +9,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.zeromq.ZMQ;
+import com.google.protobuf.Message;
 import shared.mensageria.Mensageria;
 import shared.mensageria.RelogioProcesso;
 
@@ -41,6 +44,8 @@ public class ServidorJava {
   private final RelogioProcesso relogio = new RelogioProcesso();
   private final Object stateLock = new Object();
   private final Map<String, Integer> servidoresAtivos = new HashMap<>();
+  private final Map<String, TxCacheEntry> txCache = new HashMap<>();
+  private final List<String> txOrder = new ArrayList<>();
 
   private int requestsProcessadas = 0;
   private String coordenadorAtual = "";
@@ -49,6 +54,16 @@ public class ServidorJava {
   private boolean electionRunning = false;
 
   private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+
+  private static final class TxCacheEntry {
+    private final byte[] payload;
+    private boolean completed;
+
+    private TxCacheEntry(byte[] payload, boolean completed) {
+      this.payload = payload;
+      this.completed = completed;
+    }
+  }
 
   public ServidorJava(
       String orqEndpoint,
@@ -198,22 +213,17 @@ public class ServidorJava {
     Contrato.HeartbeatResponse res = resp.getHeartbeatRes();
     if (res.getStatus() != Contrato.Status.STATUS_SUCESSO) {
       System.err.println("[SERVIDOR] Heartbeat rejeitado: " + res.getErroMsg());
+      try {
+        System.out.println("[SERVIDOR] Reregistrando servidor após heartbeat rejeitado");
+        registrarNaReferencia();
+        refreshCluster("heartbeat rejeitado pela referência");
+      } catch (Exception ex) {
+        System.out.println("[SERVIDOR] Falha ao reregistrar na referência: " + ex.getMessage());
+      }
       return;
     }
     System.out.println("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
-    List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
-    String coordenador = coordenadorAtual();
-    boolean encontrado = false;
-    for (Contrato.ServerInfo servidor : servidores) {
-      if (servidor.getNome().equals(coordenador)) {
-        encontrado = true;
-        break;
-      }
-    }
-    if (!coordenador.isEmpty() && !encontrado) {
-      System.out.println("[SERVIDOR] Coordenador " + coordenador + " ausente da lista ativa; iniciando eleição");
-      iniciarEleicaoAsync("coordenador ausente da lista ativa");
-    }
+    refreshCluster("heartbeat bem-sucedido");
   }
 
   private List<String> lerCanais() {
@@ -279,6 +289,111 @@ public class ServidorJava {
       );
     } catch (Exception e) {
     }
+  }
+
+  private String chaveTransacao(Contrato.Envelope env) {
+    Contrato.Cabecalho cab = env.getCabecalho();
+    return String.join(
+        "|",
+        env.getConteudoCase().name(),
+        cab.getLinguagemOrigem(),
+        Integer.toString(cab.getIdTransacao()),
+        Mensageria.timestampTexto(cab.getTimestampEnvio())
+    );
+  }
+
+  private byte[] serializarResposta(Message resp) {
+    return resp.toByteArray();
+  }
+
+  private Message respostaCache(Contrato.Envelope env, String chave) {
+    synchronized (stateLock) {
+      TxCacheEntry entry = txCache.get(chave);
+      if (entry == null || entry.payload.length == 0) {
+        return null;
+      }
+      try {
+        return switch (env.getConteudoCase()) {
+          case LOGIN_REQ -> Contrato.LoginResponse.parseFrom(entry.payload);
+          case CREATE_CHANNEL_REQ -> Contrato.CreateChannelResponse.parseFrom(entry.payload);
+          case PUBLISH_REQ -> Contrato.PublishResponse.parseFrom(entry.payload);
+          default -> null;
+        };
+      } catch (Exception e) {
+        return null;
+      }
+    }
+  }
+
+  private TxCacheEntry cacheObter(String chave) {
+    synchronized (stateLock) {
+      TxCacheEntry entry = txCache.get(chave);
+      if (entry == null) {
+        return null;
+      }
+      return new TxCacheEntry(entry.payload, entry.completed);
+    }
+  }
+
+  private void cacheRegistrarAplicada(String chave, Message resp) {
+    synchronized (stateLock) {
+      if (!txCache.containsKey(chave)) {
+        txOrder.add(chave);
+      }
+      txCache.put(chave, new TxCacheEntry(serializarResposta(resp), false));
+      while (txOrder.size() > 1024) {
+        String oldest = txOrder.remove(0);
+        txCache.remove(oldest);
+      }
+    }
+  }
+
+  private void cacheMarcarConcluida(String chave) {
+    synchronized (stateLock) {
+      TxCacheEntry entry = txCache.get(chave);
+      if (entry != null) {
+        entry.completed = true;
+      }
+    }
+  }
+
+  private void refreshCluster(String motivo) {
+    try {
+      List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
+      String coordenador = coordenadorAtual();
+      boolean encontrado = false;
+      for (Contrato.ServerInfo servidor : servidores) {
+        if (servidor.getNome().equals(coordenador)) {
+          encontrado = true;
+          break;
+        }
+      }
+      if (!coordenador.isEmpty() && !encontrado) {
+        System.out.println("[SERVIDOR] Coordenador " + coordenador + " ausente da lista ativa; iniciando eleição (" + motivo + ")");
+        executarEleicao(motivo);
+      }
+    } catch (Exception e) {
+      System.out.println("[SERVIDOR] Falha ao refrescar cluster: " + e.getMessage());
+    }
+  }
+
+  private boolean erroCoordenador(String msg) {
+    return "nao sou coordenador".equals(msg) || "coordenador indisponivel".equals(msg);
+  }
+
+  private Object processarRequisicaoEscrita(Contrato.Envelope env) {
+    return switch (env.getConteudoCase()) {
+      case LOGIN_REQ -> isCoordenador()
+          ? processarEscritaComReplicacao(env, chaveTransacao(env))
+          : encaminharEscritaAoCoordenador(env, "login");
+      case CREATE_CHANNEL_REQ -> isCoordenador()
+          ? processarEscritaComReplicacao(env, chaveTransacao(env))
+          : encaminharEscritaAoCoordenador(env, "create_channel");
+      case PUBLISH_REQ -> isCoordenador()
+          ? processarEscritaComReplicacao(env, chaveTransacao(env))
+          : encaminharEscritaAoCoordenador(env, "publish");
+      default -> null;
+    };
   }
 
   private Contrato.LoginResponse erroLogin(String mensagem) {
@@ -563,7 +678,7 @@ public class ServidorJava {
             default -> erroPublish("nao sou coordenador");
           };
         } else {
-          resposta = processarEscritaComReplicacao(env);
+          resposta = processarEscritaComReplicacao(env, chaveTransacao(env));
         }
         sock.send(envelopeResposta(resposta).toByteArray(), 0);
       }
@@ -591,7 +706,7 @@ public class ServidorJava {
         }
 
         relogio.onReceive(env.getCabecalho().getRelogioLogico());
-        Object resposta = aplicarEscritaLocal(env, true);
+        Object resposta = aplicarEscritaLocal(env, true, chaveTransacao(env));
         sock.send(envelopeResposta(resposta).toByteArray(), 0);
       }
     } catch (Exception e) {
@@ -913,6 +1028,15 @@ public class ServidorJava {
   }
 
   private Object encaminharEscritaAoCoordenador(Contrato.Envelope env, String operacao) {
+    String chave = chaveTransacao(env);
+    TxCacheEntry entry = cacheObter(chave);
+    if (entry != null && entry.completed) {
+      Message cached = respostaCache(env, chave);
+      if (cached instanceof Contrato.LoginResponse lr) return lr;
+      if (cached instanceof Contrato.CreateChannelResponse cr) return cr;
+      if (cached instanceof Contrato.PublishResponse pr) return pr;
+    }
+
     String coordenador = coordenadorAtual();
     if (coordenador.isBlank()) {
       executarEleicao("coordenador desconhecido para escrita");
@@ -926,71 +1050,138 @@ public class ServidorJava {
       };
     }
 
-    PeerReply reply = enviarParaServidor(coordenador, WRITE_PORT, env, REQUEST_TIMEOUT_MS);
-    if (reply == null) {
+    for (int tentativa = 0; tentativa < 2; tentativa++) {
+      PeerReply reply = enviarParaServidor(coordenador, WRITE_PORT, env, REQUEST_TIMEOUT_MS);
+      if (reply != null) {
+        switch (operacao) {
+          case "login" -> {
+            if (reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.LOGIN_RES) {
+              Contrato.LoginResponse resposta = reply.envelope.getLoginRes();
+              if (resposta.getStatus() == Contrato.Status.STATUS_SUCESSO) return resposta;
+              if (!erroCoordenador(resposta.getErroMsg())) return resposta;
+            }
+          }
+          case "create_channel" -> {
+            if (reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.CREATE_CHANNEL_RES) {
+              Contrato.CreateChannelResponse resposta = reply.envelope.getCreateChannelRes();
+              if (resposta.getStatus() == Contrato.Status.STATUS_SUCESSO) return resposta;
+              if (!erroCoordenador(resposta.getErroMsg())) return resposta;
+            }
+          }
+          default -> {
+            if (reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.PUBLISH_RES) {
+              Contrato.PublishResponse resposta = reply.envelope.getPublishRes();
+              if (resposta.getStatus() == Contrato.Status.STATUS_SUCESSO) return resposta;
+              if (!erroCoordenador(resposta.getErroMsg())) return resposta;
+            }
+          }
+        }
+      }
+
+      refreshCluster("falha ao encaminhar escrita");
       executarEleicao("falha ao encaminhar escrita");
-      return switch (operacao) {
-        case "login" -> erroLogin("coordenador indisponivel");
-        case "create_channel" -> erroCreateChannel("coordenador indisponivel");
-        default -> erroPublish("coordenador indisponivel");
-      };
+      if (isCoordenador()) {
+        return processarEscritaComReplicacao(env, chave);
+      }
+      coordenador = coordenadorAtual();
+      if (coordenador.isBlank() || coordenador.equals(serverName)) {
+        break;
+      }
     }
 
     return switch (operacao) {
-      case "login" -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.LOGIN_RES
-          ? reply.envelope.getLoginRes()
-          : erroLogin("resposta inesperada do coordenador");
-      case "create_channel" -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.CREATE_CHANNEL_RES
-          ? reply.envelope.getCreateChannelRes()
-          : erroCreateChannel("resposta inesperada do coordenador");
-      default -> reply.envelope.getConteudoCase() == Contrato.Envelope.ConteudoCase.PUBLISH_RES
-          ? reply.envelope.getPublishRes()
-          : erroPublish("resposta inesperada do coordenador");
+      case "login" -> erroLogin("coordenador indisponivel");
+      case "create_channel" -> erroCreateChannel("coordenador indisponivel");
+      default -> erroPublish("coordenador indisponivel");
     };
   }
 
-  private Object replicarEscrita(Contrato.Envelope env) {
+  private Object replicarEscrita(Contrato.Envelope env, String chave) {
+    Set<String> alvosPendentes = new HashSet<>();
     for (Contrato.ServerInfo servidor : servidoresAtivosSnapshot()) {
-      if (servidor.getNome().equals(serverName)) {
-        continue;
-      }
-      PeerReply reply = enviarParaServidor(servidor.getNome(), REPLICATION_PORT, env, REQUEST_TIMEOUT_MS);
-      if (reply == null) {
-        return switch (env.getConteudoCase()) {
-          case LOGIN_REQ -> erroLogin("falha ao replicar em " + servidor.getNome());
-          case CREATE_CHANNEL_REQ -> erroCreateChannel("falha ao replicar em " + servidor.getNome());
-          default -> erroPublish("falha ao replicar em " + servidor.getNome());
-        };
-      }
-      switch (reply.envelope.getConteudoCase()) {
-        case LOGIN_RES -> {
-          if (reply.envelope.getLoginRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
-            return reply.envelope.getLoginRes();
-          }
-        }
-        case CREATE_CHANNEL_RES -> {
-          if (reply.envelope.getCreateChannelRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
-            return reply.envelope.getCreateChannelRes();
-          }
-        }
-        case PUBLISH_RES -> {
-          if (reply.envelope.getPublishRes().getStatus() != Contrato.Status.STATUS_SUCESSO) {
-            return reply.envelope.getPublishRes();
-          }
-        }
-        default -> {
-          return switch (env.getConteudoCase()) {
-            case LOGIN_REQ -> erroLogin("resposta inesperada na replica");
-            case CREATE_CHANNEL_REQ -> erroCreateChannel("resposta inesperada na replica");
-            default -> erroPublish("resposta inesperada na replica");
-          };
-        }
+      if (!servidor.getNome().equals(serverName)) {
+        alvosPendentes.add(servidor.getNome());
       }
     }
-    return null;
+    Map<String, Boolean> confirmados = new HashMap<>();
+
+    if (alvosPendentes.isEmpty()) {
+      return null;
+    }
+
+    for (int tentativa = 0; tentativa < 2; tentativa++) {
+      List<String> pendentes = new ArrayList<>();
+      for (String nomeServidor : alvosPendentes) {
+        if (!confirmados.containsKey(nomeServidor)) {
+          pendentes.add(nomeServidor);
+        }
+      }
+      if (pendentes.isEmpty()) {
+        return null;
+      }
+
+      for (String nomeServidor : pendentes) {
+        PeerReply reply = enviarParaServidor(nomeServidor, REPLICATION_PORT, env, REQUEST_TIMEOUT_MS);
+        if (reply != null) {
+          switch (reply.envelope.getConteudoCase()) {
+            case LOGIN_RES -> {
+              if (reply.envelope.getLoginRes().getStatus() == Contrato.Status.STATUS_SUCESSO) {
+                confirmados.put(nomeServidor, true);
+                continue;
+              }
+            }
+            case CREATE_CHANNEL_RES -> {
+              if (reply.envelope.getCreateChannelRes().getStatus() == Contrato.Status.STATUS_SUCESSO) {
+                confirmados.put(nomeServidor, true);
+                continue;
+              }
+            }
+            case PUBLISH_RES -> {
+              if (reply.envelope.getPublishRes().getStatus() == Contrato.Status.STATUS_SUCESSO) {
+                confirmados.put(nomeServidor, true);
+                continue;
+              }
+            }
+            default -> {
+            }
+          }
+        }
+      }
+
+      refreshCluster("falha ao replicar escrita");
+      Set<String> ativos = new HashSet<>();
+      for (Contrato.ServerInfo servidor : servidoresAtivosSnapshot()) {
+        if (!servidor.getNome().equals(serverName)) {
+          ativos.add(servidor.getNome());
+        }
+      }
+      alvosPendentes.retainAll(ativos);
+      confirmados.keySet().retainAll(alvosPendentes);
+      if (alvosPendentes.isEmpty() || confirmados.size() == alvosPendentes.size()) {
+        return null;
+      }
+    }
+
+    if (confirmados.size() == alvosPendentes.size()) {
+      return null;
+    }
+
+    return switch (env.getConteudoCase()) {
+      case LOGIN_REQ -> erroLogin("falha ao replicar escrita");
+      case CREATE_CHANNEL_REQ -> erroCreateChannel("falha ao replicar escrita");
+      default -> erroPublish("falha ao replicar escrita");
+    };
   }
 
-  private Object aplicarEscritaLocal(Contrato.Envelope env, boolean origemReplicacao) {
+  private Object aplicarEscritaLocal(Contrato.Envelope env, boolean origemReplicacao, String chave) {
+    TxCacheEntry entry = cacheObter(chave);
+    if (entry != null && (entry.completed || origemReplicacao)) {
+      Message cached = respostaCache(env, chave);
+      if (cached instanceof Contrato.LoginResponse lr) return lr;
+      if (cached instanceof Contrato.CreateChannelResponse cr) return cr;
+      if (cached instanceof Contrato.PublishResponse pr) return pr;
+    }
+
     return switch (env.getConteudoCase()) {
       case LOGIN_REQ -> processarLogin(env.getLoginReq());
       case CREATE_CHANNEL_REQ -> processarCreateChannel(env.getCreateChannelReq(), origemReplicacao);
@@ -999,20 +1190,37 @@ public class ServidorJava {
     };
   }
 
-  private Object processarEscritaComReplicacao(Contrato.Envelope env) {
-    Object resposta = aplicarEscritaLocal(env, false);
-    if (resposta instanceof Contrato.LoginResponse lr && lr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      return lr;
-    }
-    if (resposta instanceof Contrato.CreateChannelResponse cr && cr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      return cr;
-    }
-    if (resposta instanceof Contrato.PublishResponse pr && pr.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      return pr;
+  private Object processarEscritaComReplicacao(Contrato.Envelope env, String chave) {
+    TxCacheEntry entry = cacheObter(chave);
+    if (entry != null && entry.completed) {
+      Message cached = respostaCache(env, chave);
+      if (cached instanceof Contrato.LoginResponse lr) return lr;
+      if (cached instanceof Contrato.CreateChannelResponse cr) return cr;
+      if (cached instanceof Contrato.PublishResponse pr) return pr;
     }
 
-    Object replicaErro = replicarEscrita(env);
-    return replicaErro == null ? resposta : replicaErro;
+    Object resposta;
+    if (entry != null) {
+      Message cached = respostaCache(env, chave);
+      resposta = cached != null ? cached : aplicarEscritaLocal(env, false, chave);
+    } else {
+      resposta = aplicarEscritaLocal(env, false, chave);
+      if (resposta instanceof Contrato.LoginResponse lr && lr.getStatus() != Contrato.Status.STATUS_SUCESSO) return lr;
+      if (resposta instanceof Contrato.CreateChannelResponse cr && cr.getStatus() != Contrato.Status.STATUS_SUCESSO) return cr;
+      if (resposta instanceof Contrato.PublishResponse pr && pr.getStatus() != Contrato.Status.STATUS_SUCESSO) return pr;
+    }
+
+    if (resposta instanceof Contrato.LoginResponse lr && lr.getStatus() != Contrato.Status.STATUS_SUCESSO) return lr;
+    if (resposta instanceof Contrato.CreateChannelResponse cr && cr.getStatus() != Contrato.Status.STATUS_SUCESSO) return cr;
+    if (resposta instanceof Contrato.PublishResponse pr && pr.getStatus() != Contrato.Status.STATUS_SUCESSO) return pr;
+
+    cacheRegistrarAplicada(chave, (Message) resposta);
+    Object replicaErro = replicarEscrita(env, chave);
+    if (replicaErro != null) {
+      return replicaErro;
+    }
+    cacheMarcarConcluida(chave);
+    return resposta;
   }
 
   private boolean sincronizarComoSeguidor(String coordenador) {
@@ -1224,16 +1432,10 @@ public class ServidorJava {
       System.out.println("[SERVIDOR] Recebido " + tipo + " " + Mensageria.cabecalhoTexto(env.getCabecalho()));
 
       Object resposta = switch (tipo) {
-        case LOGIN_REQ -> isCoordenador()
-            ? processarEscritaComReplicacao(env)
-            : encaminharEscritaAoCoordenador(env, "login");
-        case CREATE_CHANNEL_REQ -> isCoordenador()
-            ? processarEscritaComReplicacao(env)
-            : encaminharEscritaAoCoordenador(env, "create_channel");
+        case LOGIN_REQ -> processarRequisicaoEscrita(env);
+        case CREATE_CHANNEL_REQ -> processarRequisicaoEscrita(env);
         case LIST_CHANNELS_REQ -> processarListChannels();
-        case PUBLISH_REQ -> isCoordenador()
-            ? processarEscritaComReplicacao(env)
-            : encaminharEscritaAoCoordenador(env, "publish");
+        case PUBLISH_REQ -> processarRequisicaoEscrita(env);
         default -> null;
       };
 

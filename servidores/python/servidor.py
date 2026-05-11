@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from collections import OrderedDict
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,7 @@ class Servidor:
         self._active_servers: dict[str, int] = {}
         self._my_rank = 0
         self._election_running = False
+        self._tx_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         logging.info("Servidor conectado ao orquestrador em %s", ORQ_ENDPOINT)
         logging.info("Servidor conectado ao proxy pub em %s", PROXY_PUB_ENDPOINT)
         logging.info("Servidor conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
@@ -127,6 +129,72 @@ class Servidor:
                 )
                 + "\n"
             )
+
+    def _chave_transacao(self, env: contrato_pb2.Envelope) -> str:
+        cab = env.cabecalho
+        return "|".join(
+            [
+                env.WhichOneof("conteudo") or "desconhecido",
+                cab.linguagem_origem,
+                str(cab.id_transacao),
+                timestamp_to_text(cab.timestamp_envio),
+            ]
+        )
+
+    def _cache_resposta_para_envelope(
+        self, tipo_req: str, payload: bytes
+    ) -> (
+        contrato_pb2.LoginResponse
+        | contrato_pb2.CreateChannelResponse
+        | contrato_pb2.PublishResponse
+    ):
+        if tipo_req == "login_req":
+            resp = contrato_pb2.LoginResponse()
+            resp.ParseFromString(payload)
+            return resp
+        if tipo_req == "create_channel_req":
+            resp = contrato_pb2.CreateChannelResponse()
+            resp.ParseFromString(payload)
+            return resp
+        resp = contrato_pb2.PublishResponse()
+        resp.ParseFromString(payload)
+        return resp
+
+    def _cache_obter(self, chave: str) -> dict[str, object] | None:
+        with self._lock:
+            entry = self._tx_cache.get(chave)
+            if entry is None:
+                return None
+            self._tx_cache.move_to_end(chave)
+            return dict(entry)
+
+    def _cache_registrar_aplicada(self, chave: str, resp: object) -> None:
+        payload = resp.SerializeToString()
+        with self._lock:
+            self._tx_cache[chave] = {
+                "payload": payload,
+                "completed": False,
+            }
+            self._tx_cache.move_to_end(chave)
+            while len(self._tx_cache) > 1024:
+                self._tx_cache.popitem(last=False)
+
+    def _cache_marcar_concluida(self, chave: str) -> None:
+        with self._lock:
+            entry = self._tx_cache.get(chave)
+            if entry is not None:
+                entry["completed"] = True
+
+    def _resposta_cache(self, env: contrato_pb2.Envelope, chave: str):
+        entry = self._cache_obter(chave)
+        if entry is None:
+            return None
+        payload = entry.get("payload")
+        if not isinstance(payload, (bytes, bytearray)):
+            return None
+        return self._cache_resposta_para_envelope(
+            env.WhichOneof("conteudo") or "desconhecido", bytes(payload)
+        )
 
     def _erro_login(self, mensagem: str) -> contrato_pb2.LoginResponse:
         res = contrato_pb2.LoginResponse()
@@ -233,6 +301,19 @@ class Servidor:
         self._atualizar_servidores_ativos(servidores)
         return servidores
 
+    def _refrescar_cluster(self, motivo: str) -> list[contrato_pb2.ServerInfo]:
+        servidores = self._listar_servidores_referencia()
+        coordenador = self._coordenador_atual()
+        ativos = {item.nome for item in servidores}
+        if coordenador and coordenador not in ativos:
+            logging.warning(
+                "Coordenador %s ausente da lista ativa; iniciando eleição (%s)",
+                coordenador,
+                motivo,
+            )
+            self._executar_eleicao(motivo)
+        return servidores
+
     def _heartbeat_e_sincronizar(self) -> None:
         env = contrato_pb2.Envelope()
         env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
@@ -249,16 +330,37 @@ class Servidor:
         res = resp_env.heartbeat_res
         if res.status != contrato_pb2.STATUS_SUCESSO:
             logging.warning("Falha ao enviar heartbeat: %s", res.erro_msg)
+            try:
+                logging.info("Reregistrando servidor após heartbeat rejeitado")
+                self._registrar_na_referencia()
+            except Exception as exc:
+                logging.warning("Falha ao reregistrar na referência: %s", exc)
+                return
+            self._refrescar_cluster("heartbeat rejeitado pela referência")
             return
 
         logging.info("Heartbeat enviado com sucesso para %s", SERVER_NAME)
-        servidores = self._listar_servidores_referencia()
-        if self._coordenador_atual() and self._coordenador_atual() not in {item.nome for item in servidores}:
-            logging.warning(
-                "Coordenador %s ausente da lista ativa; iniciando eleição",
-                self._coordenador_atual(),
-            )
-            self._iniciar_eleicao_async("coordenador ausente da lista ativa")
+        self._refrescar_cluster("heartbeat bem-sucedido")
+
+    def _processar_requisicao_escrita(
+        self, env: contrato_pb2.Envelope
+    ) -> (
+        contrato_pb2.LoginResponse
+        | contrato_pb2.CreateChannelResponse
+        | contrato_pb2.PublishResponse
+    ):
+        tipo = env.WhichOneof("conteudo")
+        chave = self._chave_transacao(env)
+        if tipo == "login_req":
+            operacao = "login"
+        elif tipo == "create_channel_req":
+            operacao = "create_channel"
+        else:
+            operacao = "publish"
+
+        if self._is_coordenador():
+            return self._processar_escrita_com_replicacao(env, chave)
+        return self._encaminhar_escrita_ao_coordenador(env, operacao, chave)
 
     def loop(self) -> None:
         logging.info("Servidor iniciado. Aguardando mensagens...")
@@ -272,22 +374,13 @@ class Servidor:
             logging.info("Recebido %s %s", tipo, cabecalho_texto(env.cabecalho))
 
             if tipo == "login_req":
-                if not self._is_coordenador():
-                    resp = self._encaminhar_escrita_ao_coordenador(env, "login")
-                else:
-                    resp = self._processar_escrita_com_replicacao(env)
+                resp = self._processar_requisicao_escrita(env)
             elif tipo == "create_channel_req":
-                if not self._is_coordenador():
-                    resp = self._encaminhar_escrita_ao_coordenador(env, "create_channel")
-                else:
-                    resp = self._processar_escrita_com_replicacao(env)
+                resp = self._processar_requisicao_escrita(env)
             elif tipo == "list_channels_req":
                 resp = self._processar_list_channels(env.list_channels_req)
             elif tipo == "publish_req":
-                if not self._is_coordenador():
-                    resp = self._encaminhar_escrita_ao_coordenador(env, "publish")
-                else:
-                    resp = self._processar_escrita_com_replicacao(env)
+                resp = self._processar_requisicao_escrita(env)
             else:
                 logging.warning("Tipo de mensagem não suportado: %s", tipo)
                 continue
@@ -487,7 +580,7 @@ class Servidor:
                     else:
                         resp = self._erro_publish("nao sou coordenador")
                 else:
-                    resp = self._processar_escrita_com_replicacao(env)
+                    resp = self._processar_escrita_com_replicacao(env, self._chave_transacao(env))
                 socket.send(envelope_bytes(self._resposta_para_envelope(resp)))
             except Exception as exc:
                 logging.warning("Erro no serviço interno de escrita: %s", exc)
@@ -501,7 +594,9 @@ class Servidor:
                 data = socket.recv()
                 env = envelope_from_bytes(data)
                 self.relogio.on_receive(env.cabecalho.relogio_logico)
-                resp = self._aplicar_escrita_local(env, origem_replicacao=True)
+                resp = self._aplicar_escrita_local(
+                    env, origem_replicacao=True, chave=self._chave_transacao(env)
+                )
                 socket.send(envelope_bytes(self._resposta_para_envelope(resp)))
             except Exception as exc:
                 logging.warning("Erro no serviço interno de réplica: %s", exc)
@@ -788,12 +883,18 @@ class Servidor:
         return True
 
     def _encaminhar_escrita_ao_coordenador(
-        self, env: contrato_pb2.Envelope, operacao: str
+        self, env: contrato_pb2.Envelope, operacao: str, chave: str
     ) -> (
         contrato_pb2.LoginResponse
         | contrato_pb2.CreateChannelResponse
         | contrato_pb2.PublishResponse
     ):
+        entry = self._cache_obter(chave)
+        if entry is not None and entry.get("completed"):
+            cached = self._resposta_cache(env, chave)
+            if cached is not None:
+                return cached
+
         coordenador = self._coordenador_atual()
         if not coordenador:
             self._executar_eleicao("coordenador desconhecido para escrita")
@@ -806,25 +907,38 @@ class Servidor:
                 return self._erro_create_channel(mensagem)
             return self._erro_publish(mensagem)
 
-        resp_env, _, _ = self._enviar_para_servidor(coordenador, WRITE_PORT, env)
-        if resp_env is None:
+        for tentativa in range(2):
+            resp_env, _, _ = self._enviar_para_servidor(coordenador, WRITE_PORT, env)
+            if resp_env is not None:
+                tipo = resp_env.WhichOneof("conteudo")
+                if operacao == "login" and tipo == "login_res":
+                    resposta = resp_env.login_res
+                    if resposta.status == contrato_pb2.STATUS_SUCESSO:
+                        return resposta
+                    if resposta.erro_msg not in {"nao sou coordenador", "coordenador indisponivel"}:
+                        return resposta
+                elif operacao == "create_channel" and tipo == "create_channel_res":
+                    resposta = resp_env.create_channel_res
+                    if resposta.status == contrato_pb2.STATUS_SUCESSO:
+                        return resposta
+                    if resposta.erro_msg not in {"nao sou coordenador", "coordenador indisponivel"}:
+                        return resposta
+                elif operacao == "publish" and tipo == "publish_res":
+                    resposta = resp_env.publish_res
+                    if resposta.status == contrato_pb2.STATUS_SUCESSO:
+                        return resposta
+                    if resposta.erro_msg not in {"nao sou coordenador", "coordenador indisponivel"}:
+                        return resposta
+
+            self._refrescar_cluster("falha ao encaminhar escrita")
             self._executar_eleicao("falha ao encaminhar escrita")
-            mensagem = "coordenador indisponivel"
-            if operacao == "login":
-                return self._erro_login(mensagem)
-            if operacao == "create_channel":
-                return self._erro_create_channel(mensagem)
-            return self._erro_publish(mensagem)
+            if self._is_coordenador():
+                return self._processar_escrita_com_replicacao(env, chave)
+            coordenador = self._coordenador_atual()
+            if not coordenador or coordenador == SERVER_NAME:
+                break
 
-        tipo = resp_env.WhichOneof("conteudo")
-        if operacao == "login" and tipo == "login_res":
-            return resp_env.login_res
-        if operacao == "create_channel" and tipo == "create_channel_res":
-            return resp_env.create_channel_res
-        if operacao == "publish" and tipo == "publish_res":
-            return resp_env.publish_res
-
-        mensagem = "resposta inesperada do coordenador"
+        mensagem = "coordenador indisponivel"
         if operacao == "login":
             return self._erro_login(mensagem)
         if operacao == "create_channel":
@@ -832,7 +946,7 @@ class Servidor:
         return self._erro_publish(mensagem)
 
     def _replicar_escrita(
-        self, env: contrato_pb2.Envelope
+        self, env: contrato_pb2.Envelope, chave: str
     ) -> (
         contrato_pb2.LoginResponse
         | contrato_pb2.CreateChannelResponse
@@ -840,40 +954,71 @@ class Servidor:
         | None
     ):
         tipo = env.WhichOneof("conteudo")
-        for item in self._servidores_ativos_snapshot():
-            if item.nome == SERVER_NAME:
-                continue
-            resp_env, _, _ = self._enviar_para_servidor(item.nome, REPLICATION_PORT, env)
-            if resp_env is None:
-                mensagem = f"falha ao replicar em {item.nome}"
-            else:
-                mensagem = ""
+        alvos_pendentes = {
+            item.nome
+            for item in self._servidores_ativos_snapshot()
+            if item.nome != SERVER_NAME
+        }
+        confirmados: set[str] = set()
 
-            if tipo == "login_req":
-                if resp_env is None or resp_env.WhichOneof("conteudo") != "login_res":
-                    return self._erro_login(mensagem or "resposta inesperada na replica")
-                if resp_env.login_res.status != contrato_pb2.STATUS_SUCESSO:
-                    return resp_env.login_res
-            elif tipo == "create_channel_req":
-                if resp_env is None or resp_env.WhichOneof("conteudo") != "create_channel_res":
-                    return self._erro_create_channel(mensagem or "resposta inesperada na replica")
-                if resp_env.create_channel_res.status != contrato_pb2.STATUS_SUCESSO:
-                    return resp_env.create_channel_res
-            elif tipo == "publish_req":
-                if resp_env is None or resp_env.WhichOneof("conteudo") != "publish_res":
-                    return self._erro_publish(mensagem or "resposta inesperada na replica")
-                if resp_env.publish_res.status != contrato_pb2.STATUS_SUCESSO:
-                    return resp_env.publish_res
-        return None
+        if not alvos_pendentes:
+            return None
+
+        for tentativa in range(2):
+            pendentes = list(alvos_pendentes - confirmados)
+            if not pendentes:
+                return None
+
+            for nome_servidor in pendentes:
+                resp_env, _, _ = self._enviar_para_servidor(
+                    nome_servidor, REPLICATION_PORT, env
+                )
+                if resp_env is not None:
+                    conteudo = resp_env.WhichOneof("conteudo")
+                    if tipo == "login_req" and conteudo == "login_res" and resp_env.login_res.status == contrato_pb2.STATUS_SUCESSO:
+                        confirmados.add(nome_servidor)
+                        continue
+                    if tipo == "create_channel_req" and conteudo == "create_channel_res" and resp_env.create_channel_res.status == contrato_pb2.STATUS_SUCESSO:
+                        confirmados.add(nome_servidor)
+                        continue
+                    if tipo == "publish_req" and conteudo == "publish_res" and resp_env.publish_res.status == contrato_pb2.STATUS_SUCESSO:
+                        confirmados.add(nome_servidor)
+                        continue
+
+            ativos = {
+                item.nome
+                for item in self._refrescar_cluster("falha ao replicar escrita")
+                if item.nome != SERVER_NAME
+            }
+            alvos_pendentes.intersection_update(ativos)
+            confirmados.intersection_update(alvos_pendentes)
+            if not alvos_pendentes or confirmados == alvos_pendentes:
+                return None
+
+        if confirmados == alvos_pendentes:
+            return None
+
+        if tipo == "login_req":
+            return self._erro_login("falha ao replicar escrita")
+        if tipo == "create_channel_req":
+            return self._erro_create_channel("falha ao replicar escrita")
+        return self._erro_publish("falha ao replicar escrita")
 
     def _aplicar_escrita_local(
-        self, env: contrato_pb2.Envelope, *, origem_replicacao: bool
+        self, env: contrato_pb2.Envelope, *, origem_replicacao: bool, chave: str | None = None
     ) -> (
         contrato_pb2.LoginResponse
         | contrato_pb2.CreateChannelResponse
         | contrato_pb2.PublishResponse
     ):
         tipo = env.WhichOneof("conteudo")
+        if chave is not None:
+            entry = self._cache_obter(chave)
+            if entry is not None and (entry.get("completed") or origem_replicacao):
+                cached = self._resposta_cache(env, chave)
+                if cached is not None:
+                    return cached
+
         if tipo == "login_req":
             return self._processar_login(env.login_req)
         if tipo == "create_channel_req":
@@ -889,18 +1034,35 @@ class Servidor:
         return self._erro_publish("tipo de escrita nao suportado")
 
     def _processar_escrita_com_replicacao(
-        self, env: contrato_pb2.Envelope
+        self, env: contrato_pb2.Envelope, chave: str
     ) -> (
         contrato_pb2.LoginResponse
         | contrato_pb2.CreateChannelResponse
         | contrato_pb2.PublishResponse
     ):
-        resp = self._aplicar_escrita_local(env, origem_replicacao=False)
+        entry = self._cache_obter(chave)
+        if entry is not None and entry.get("completed"):
+            cached = self._resposta_cache(env, chave)
+            if cached is not None:
+                return cached
+
+        if entry is not None:
+            resp = self._resposta_cache(env, chave)
+            if resp is None:
+                resp = self._aplicar_escrita_local(env, origem_replicacao=False, chave=chave)
+        else:
+            resp = self._aplicar_escrita_local(env, origem_replicacao=False, chave=chave)
+            if getattr(resp, "status", contrato_pb2.STATUS_ERRO) != contrato_pb2.STATUS_SUCESSO:
+                return resp
+            self._cache_registrar_aplicada(chave, resp)
+
         if getattr(resp, "status", contrato_pb2.STATUS_ERRO) != contrato_pb2.STATUS_SUCESSO:
             return resp
-        erro_replicacao = self._replicar_escrita(env)
+
+        erro_replicacao = self._replicar_escrita(env, chave)
         if erro_replicacao is not None:
             return erro_replicacao
+        self._cache_marcar_concluida(chave)
         return resp
 
     def _sincronizar_como_seguidor(self, coordenador: str) -> bool:

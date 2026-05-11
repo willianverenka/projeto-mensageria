@@ -41,7 +41,7 @@ services:
       - SERVER_NAME=servidor_python
       - DATA_DIR=/data
     volumes:
-      - ./dados/servidor_python:/data
+      - ${DATA_ROOT:-./dados}/servidor_python:/data
     depends_on:
       - orquestrador
       - proxy
@@ -76,7 +76,7 @@ services:
       - SERVER_NAME=servidor_go
       - DATA_DIR=/data
     volumes:
-      - ./dados/servidor_go:/data
+      - ${DATA_ROOT:-./dados}/servidor_go:/data
     depends_on:
       - orquestrador
       - proxy
@@ -111,7 +111,7 @@ services:
       - SERVER_NAME=servidor_java
       - DATA_DIR=/data
     volumes:
-      - ./dados/servidor_java:/data
+      - ${DATA_ROOT:-./dados}/servidor_java:/data
     depends_on:
       - orquestrador
       - proxy
@@ -145,7 +145,7 @@ services:
       - SERVER_NAME=servidor_csharp
       - DATA_DIR=/data
     volumes:
-      - ./dados/servidor_csharp:/data
+      - ${DATA_ROOT:-./dados}/servidor_csharp:/data
     depends_on:
       - orquestrador
       - proxy

@@ -66,6 +66,7 @@ func main() {
 		clock:             &mensageria.RelogioProcesso{},
 		origem:            mensageria.OrigemLabel(mensageria.RoleServidor),
 		activeServers:     map[string]int32{},
+		txCache:           map[string]*txCacheEntry{},
 	}
 	defer server.pubSock.Close()
 	defer server.announceSock.Close()
@@ -75,7 +76,9 @@ func main() {
 	log.Printf("[SERVIDOR] Conectado ao proxy sub em %s", proxySubEndpoint)
 	log.Printf("[SERVIDOR] Conectado à referência em %s", refEndpoint)
 	server.initStorage()
-	server.registrarNaReferencia()
+	if err := server.registrarNaReferencia(); err != nil {
+		log.Fatalf("[SERVIDOR] Erro ao registrar na referência: %v", err)
+	}
 	servidores := server.listarServidoresReferencia()
 	server.atualizarServidoresAtivos(servidores)
 	server.definirCoordenadorTentativo(servidores)
@@ -100,11 +103,19 @@ type Servidor struct {
 	announceSock      *zmq4.Socket
 	subSock           *zmq4.Socket
 	stateMu           sync.RWMutex
+	cacheMu           sync.RWMutex
 	coordenador       string
 	coordenadorVersao int64
 	activeServers     map[string]int32
+	txCache           map[string]*txCacheEntry
+	txOrder           []string
 	myRank            int32
 	electionRunning   bool
+}
+
+type txCacheEntry struct {
+	payload   []byte
+	completed bool
 }
 
 func (s *Servidor) loginsPath() string { return filepath.Join(s.dataDir, "logins.jsonl") }
@@ -220,6 +231,99 @@ func erroPublish(msg string) *protos.PublishResponse {
 	return &protos.PublishResponse{Status: protos.Status_STATUS_ERRO, ErroMsg: msg}
 }
 
+func (s *Servidor) chaveTransacao(env *protos.Envelope) string {
+	cab := env.GetCabecalho()
+	return fmt.Sprintf(
+		"%s|%s|%d|%s",
+		conteudoNome(env),
+		cab.GetLinguagemOrigem(),
+		cab.GetIdTransacao(),
+		mensageria.TimestampTexto(cab.GetTimestampEnvio()),
+	)
+}
+
+func (s *Servidor) cacheRespostaParaEnvelope(env *protos.Envelope, payload []byte) proto.Message {
+	switch env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		resp := &protos.LoginResponse{}
+		_ = proto.Unmarshal(payload, resp)
+		return resp
+	case *protos.Envelope_CreateChannelReq:
+		resp := &protos.CreateChannelResponse{}
+		_ = proto.Unmarshal(payload, resp)
+		return resp
+	case *protos.Envelope_PublishReq:
+		resp := &protos.PublishResponse{}
+		_ = proto.Unmarshal(payload, resp)
+		return resp
+	default:
+		return nil
+	}
+}
+
+func (s *Servidor) cacheObter(chave string) (*txCacheEntry, bool) {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	entry, ok := s.txCache[chave]
+	if !ok {
+		return nil, false
+	}
+	copia := *entry
+	return &copia, true
+}
+
+func (s *Servidor) cacheRegistrarAplicada(chave string, resp proto.Message) {
+	payload, err := proto.Marshal(resp)
+	if err != nil {
+		return
+	}
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if _, exists := s.txCache[chave]; !exists {
+		s.txOrder = append(s.txOrder, chave)
+	}
+	s.txCache[chave] = &txCacheEntry{payload: payload, completed: false}
+	for len(s.txOrder) > 1024 {
+		oldest := s.txOrder[0]
+		s.txOrder = s.txOrder[1:]
+		delete(s.txCache, oldest)
+	}
+}
+
+func (s *Servidor) cacheMarcarConcluida(chave string) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if entry, ok := s.txCache[chave]; ok {
+		entry.completed = true
+	}
+}
+
+func (s *Servidor) respostaCache(env *protos.Envelope, chave string) proto.Message {
+	entry, ok := s.cacheObter(chave)
+	if !ok || len(entry.payload) == 0 {
+		return nil
+	}
+	return s.cacheRespostaParaEnvelope(env, entry.payload)
+}
+
+func (s *Servidor) refrescarCluster(motivo string) {
+	servidores := s.listarServidoresReferencia()
+	ativos := map[string]bool{}
+	for _, servidor := range servidores {
+		ativos[servidor.GetNome()] = true
+	}
+	coordenador := s.coordenadorAtual()
+	if coordenador != "" && !ativos[coordenador] {
+		log.Printf("[SERVIDOR] Coordenador %s ausente da lista ativa; iniciando eleição (%s)", coordenador, motivo)
+		s.executarEleicao(motivo)
+	}
+}
+
+func isErroCoordenador(msg string) bool {
+	return msg == "nao sou coordenador" || msg == "coordenador indisponivel"
+}
+
 func (s *Servidor) envelopeResposta(resp proto.Message) *protos.Envelope {
 	cab := mensageria.NovoCabecalho(s.origem, s.clock)
 	respEnv := &protos.Envelope{Cabecalho: cab}
@@ -255,7 +359,7 @@ func (s *Servidor) initStorage() {
 	}
 }
 
-func (s *Servidor) registrarNaReferencia() {
+func (s *Servidor) registrarNaReferencia() error {
 	cab := mensageria.NovoCabecalho(s.origem, s.clock)
 	req := &protos.RegisterServerRequest{Cabecalho: cab, NomeServidor: s.serverName}
 	env := &protos.Envelope{
@@ -264,18 +368,19 @@ func (s *Servidor) registrarNaReferencia() {
 	}
 	resp, err := s.enviarParaReferencia(env, true)
 	if err != nil {
-		log.Fatalf("[SERVIDOR] Erro ao registrar na referência: %v", err)
+		return err
 	}
 	res, ok := resp.GetConteudo().(*protos.Envelope_RegisterServerRes)
 	if !ok {
-		log.Fatalf("[SERVIDOR] Resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
+		return fmt.Errorf("resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
 	}
 	if res.RegisterServerRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Fatalf("[SERVIDOR] Falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
+		return fmt.Errorf("falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
 	}
 	s.myRank = res.RegisterServerRes.GetRank()
 	s.atualizarServidoresAtivos([]*protos.ServerInfo{{Nome: s.serverName, Rank: s.myRank}})
 	log.Printf("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
+	return nil
 }
 
 func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
@@ -330,23 +435,15 @@ func (s *Servidor) heartbeatESincronizar() {
 	}
 	if res.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
 		log.Printf("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
+		log.Printf("[SERVIDOR] Reregistrando servidor após heartbeat rejeitado")
+		if err := s.registrarNaReferencia(); err != nil {
+			log.Printf("[SERVIDOR] Falha ao reregistrar na referência: %v", err)
+		}
+		s.refrescarCluster("heartbeat rejeitado pela referência")
 		return
 	}
 	log.Printf("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
-	servidores := s.listarServidoresReferencia()
-	if coordenador := s.coordenadorAtual(); coordenador != "" {
-		encontrado := false
-		for _, servidor := range servidores {
-			if servidor.GetNome() == coordenador {
-				encontrado = true
-				break
-			}
-		}
-		if !encontrado {
-			log.Printf("[SERVIDOR] Coordenador %s ausente da lista ativa; iniciando eleição", coordenador)
-			s.iniciarEleicaoAsync("coordenador ausente da lista ativa")
-		}
-	}
+	s.refrescarCluster("heartbeat bem-sucedido")
 }
 
 func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bool) (*protos.Envelope, error) {
@@ -447,25 +544,13 @@ func (s *Servidor) loop() {
 		var resp proto.Message
 		switch c := conteudo.(type) {
 		case *protos.Envelope_LoginReq:
-			if !s.isCoordenador() {
-				resp = s.encaminharEscritaAoCoordenador(env, "login")
-			} else {
-				resp = s.processarEscritaComReplicacao(env)
-			}
+			resp = s.processarRequisicaoEscrita(env)
 		case *protos.Envelope_CreateChannelReq:
-			if !s.isCoordenador() {
-				resp = s.encaminharEscritaAoCoordenador(env, "create_channel")
-			} else {
-				resp = s.processarEscritaComReplicacao(env)
-			}
+			resp = s.processarRequisicaoEscrita(env)
 		case *protos.Envelope_ListChannelsReq:
 			resp = s.processarListChannels(c.ListChannelsReq)
 		case *protos.Envelope_PublishReq:
-			if !s.isCoordenador() {
-				resp = s.encaminharEscritaAoCoordenador(env, "publish")
-			} else {
-				resp = s.processarEscritaComReplicacao(env)
-			}
+			resp = s.processarRequisicaoEscrita(env)
 		default:
 			log.Printf("[SERVIDOR] Tipo de mensagem não suportado: %T", conteudo)
 			continue
@@ -624,7 +709,7 @@ func (s *Servidor) loopEscritasCoordenador() {
 				resp = erroPublish("nao sou coordenador")
 			}
 		} else {
-			resp = s.processarEscritaComReplicacao(env)
+			resp = s.processarEscritaComReplicacao(env, s.chaveTransacao(env))
 		}
 		payload, _ := mensageria.EnvelopeBytes(s.envelopeResposta(resp))
 		if _, err := sock.SendBytes(payload, 0); err != nil {
@@ -649,7 +734,7 @@ func (s *Servidor) loopReplicacao() {
 			continue
 		}
 		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
-		resp := s.aplicarEscritaLocal(env, true)
+		resp := s.aplicarEscritaLocal(env, true, s.chaveTransacao(env))
 		payload, _ := mensageria.EnvelopeBytes(s.envelopeResposta(resp))
 		if _, err := sock.SendBytes(payload, 0); err != nil {
 			log.Printf("[SERVIDOR] Falha ao responder réplica interna: %v", err)
@@ -962,7 +1047,27 @@ func (s *Servidor) consultarEleicaoServidor(nomeServidor string) bool {
 	return true
 }
 
+func (s *Servidor) processarRequisicaoEscrita(env *protos.Envelope) proto.Message {
+	switch env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		return s.encaminharEscritaAoCoordenador(env, "login")
+	case *protos.Envelope_CreateChannelReq:
+		return s.encaminharEscritaAoCoordenador(env, "create_channel")
+	case *protos.Envelope_PublishReq:
+		return s.encaminharEscritaAoCoordenador(env, "publish")
+	default:
+		return erroPublish("tipo de escrita nao suportado")
+	}
+}
+
 func (s *Servidor) encaminharEscritaAoCoordenador(env *protos.Envelope, operacao string) proto.Message {
+	chave := s.chaveTransacao(env)
+	if entry, ok := s.cacheObter(chave); ok && entry.completed {
+		if cached := s.respostaCache(env, chave); cached != nil {
+			return cached
+		}
+	}
+
 	coordenador := s.coordenadorAtual()
 	if coordenador == "" {
 		s.executarEleicao("coordenador desconhecido para escrita")
@@ -977,80 +1082,152 @@ func (s *Servidor) encaminharEscritaAoCoordenador(env *protos.Envelope, operacao
 		}
 		return erroPublish("coordenador indisponivel")
 	}
-	resp, _, _, err := s.enviarParaServidor(coordenador, writePort, env, requestTimeout)
-	if err != nil || resp == nil {
+
+	for tentativa := 0; tentativa < 2; tentativa++ {
+		resp, _, _, err := s.enviarParaServidor(coordenador, writePort, env, requestTimeout)
+		if err == nil && resp != nil {
+			switch operacao {
+			case "login":
+				if r, ok := resp.GetConteudo().(*protos.Envelope_LoginRes); ok {
+					if r.LoginRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						return r.LoginRes
+					}
+					if !isErroCoordenador(r.LoginRes.GetErroMsg()) {
+						return r.LoginRes
+					}
+				}
+			case "create_channel":
+				if r, ok := resp.GetConteudo().(*protos.Envelope_CreateChannelRes); ok {
+					if r.CreateChannelRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						return r.CreateChannelRes
+					}
+					if !isErroCoordenador(r.CreateChannelRes.GetErroMsg()) {
+						return r.CreateChannelRes
+					}
+				}
+			default:
+				if r, ok := resp.GetConteudo().(*protos.Envelope_PublishRes); ok {
+					if r.PublishRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						return r.PublishRes
+					}
+					if !isErroCoordenador(r.PublishRes.GetErroMsg()) {
+						return r.PublishRes
+					}
+				}
+			}
+		}
+
+		s.refrescarCluster("falha ao encaminhar escrita")
 		s.executarEleicao("falha ao encaminhar escrita")
-		if operacao == "login" {
-			return erroLogin("coordenador indisponivel")
+		if s.isCoordenador() {
+			return s.processarEscritaComReplicacao(env, chave)
 		}
-		if operacao == "create_channel" {
-			return erroCreateChannel("coordenador indisponivel")
+		coordenador = s.coordenadorAtual()
+		if coordenador == "" || coordenador == s.serverName {
+			break
 		}
-		return erroPublish("coordenador indisponivel")
 	}
-	switch operacao {
-	case "login":
-		if r, ok := resp.GetConteudo().(*protos.Envelope_LoginRes); ok {
-			return r.LoginRes
-		}
-		return erroLogin("resposta inesperada do coordenador")
-	case "create_channel":
-		if r, ok := resp.GetConteudo().(*protos.Envelope_CreateChannelRes); ok {
-			return r.CreateChannelRes
-		}
-		return erroCreateChannel("resposta inesperada do coordenador")
-	default:
-		if r, ok := resp.GetConteudo().(*protos.Envelope_PublishRes); ok {
-			return r.PublishRes
-		}
-		return erroPublish("resposta inesperada do coordenador")
+
+	if operacao == "login" {
+		return erroLogin("coordenador indisponivel")
 	}
+	if operacao == "create_channel" {
+		return erroCreateChannel("coordenador indisponivel")
+	}
+	return erroPublish("coordenador indisponivel")
 }
 
-func (s *Servidor) replicarEscrita(env *protos.Envelope) proto.Message {
+func (s *Servidor) replicarEscrita(env *protos.Envelope, chave string) proto.Message {
+	tipo := env.GetConteudo()
+	alvosPendentes := map[string]bool{}
 	for _, item := range s.servidoresAtivosSnapshot() {
 		if item.GetNome() == s.serverName {
 			continue
 		}
-		resp, _, _, err := s.enviarParaServidor(item.GetNome(), replicationPort, env, requestTimeout)
-		if err != nil || resp == nil {
-			switch env.GetConteudo().(type) {
-			case *protos.Envelope_LoginReq:
-				return erroLogin(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
-			case *protos.Envelope_CreateChannelReq:
-				return erroCreateChannel(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
-			default:
-				return erroPublish(fmt.Sprintf("falha ao replicar em %s", item.GetNome()))
+		alvosPendentes[item.GetNome()] = true
+	}
+	confirmados := map[string]bool{}
+
+	if len(alvosPendentes) == 0 {
+		return nil
+	}
+
+	for tentativa := 0; tentativa < 2; tentativa++ {
+		pendentes := make([]string, 0, len(alvosPendentes))
+		for nome := range alvosPendentes {
+			if confirmados[nome] {
+				continue
+			}
+			pendentes = append(pendentes, nome)
+		}
+		if len(pendentes) == 0 {
+			return nil
+		}
+
+		for _, nome := range pendentes {
+			resp, _, _, err := s.enviarParaServidor(nome, replicationPort, env, requestTimeout)
+			if err == nil && resp != nil {
+				switch c := resp.GetConteudo().(type) {
+				case *protos.Envelope_LoginRes:
+					if c.LoginRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						confirmados[nome] = true
+						continue
+					}
+				case *protos.Envelope_CreateChannelRes:
+					if c.CreateChannelRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						confirmados[nome] = true
+						continue
+					}
+				case *protos.Envelope_PublishRes:
+					if c.PublishRes.GetStatus() == protos.Status_STATUS_SUCESSO {
+						confirmados[nome] = true
+						continue
+					}
+				default:
+				}
 			}
 		}
-		switch c := resp.GetConteudo().(type) {
-		case *protos.Envelope_LoginRes:
-			if c.LoginRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-				return c.LoginRes
+
+		s.refrescarCluster("falha ao replicar escrita")
+		ativos := map[string]bool{}
+		for _, item := range s.servidoresAtivosSnapshot() {
+			if item.GetNome() == s.serverName {
+				continue
 			}
-		case *protos.Envelope_CreateChannelRes:
-			if c.CreateChannelRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-				return c.CreateChannelRes
+			ativos[item.GetNome()] = true
+		}
+		for nome := range alvosPendentes {
+			if !ativos[nome] {
+				delete(alvosPendentes, nome)
+				delete(confirmados, nome)
 			}
-		case *protos.Envelope_PublishRes:
-			if c.PublishRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-				return c.PublishRes
-			}
-		default:
-			switch env.GetConteudo().(type) {
-			case *protos.Envelope_LoginReq:
-				return erroLogin("resposta inesperada na replica")
-			case *protos.Envelope_CreateChannelReq:
-				return erroCreateChannel("resposta inesperada na replica")
-			default:
-				return erroPublish("resposta inesperada na replica")
-			}
+		}
+		if len(alvosPendentes) == 0 || len(confirmados) == len(alvosPendentes) {
+			return nil
 		}
 	}
-	return nil
+
+	if len(confirmados) == len(alvosPendentes) {
+		return nil
+	}
+
+	switch tipo.(type) {
+	case *protos.Envelope_LoginReq:
+		return erroLogin("falha ao replicar escrita")
+	case *protos.Envelope_CreateChannelReq:
+		return erroCreateChannel("falha ao replicar escrita")
+	default:
+		return erroPublish("falha ao replicar escrita")
+	}
 }
 
-func (s *Servidor) aplicarEscritaLocal(env *protos.Envelope, origemReplicacao bool) proto.Message {
+func (s *Servidor) aplicarEscritaLocal(env *protos.Envelope, origemReplicacao bool, chave string) proto.Message {
+	if entry, ok := s.cacheObter(chave); ok && (entry.completed || origemReplicacao) {
+		if cached := s.respostaCache(env, chave); cached != nil {
+			return cached
+		}
+	}
+
 	switch c := env.GetConteudo().(type) {
 	case *protos.Envelope_LoginReq:
 		return s.processarLogin(c.LoginReq)
@@ -1063,25 +1240,39 @@ func (s *Servidor) aplicarEscritaLocal(env *protos.Envelope, origemReplicacao bo
 	}
 }
 
-func (s *Servidor) processarEscritaComReplicacao(env *protos.Envelope) proto.Message {
-	resp := s.aplicarEscritaLocal(env, false)
-	switch r := resp.(type) {
-	case *protos.LoginResponse:
-		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
-			return r
-		}
-	case *protos.CreateChannelResponse:
-		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
-			return r
-		}
-	case *protos.PublishResponse:
-		if r.GetStatus() != protos.Status_STATUS_SUCESSO {
-			return r
+func (s *Servidor) processarEscritaComReplicacao(env *protos.Envelope, chave string) proto.Message {
+	if entry, ok := s.cacheObter(chave); ok && entry.completed {
+		if cached := s.respostaCache(env, chave); cached != nil {
+			return cached
 		}
 	}
-	if replicaErr := s.replicarEscrita(env); replicaErr != nil {
+
+	var resp proto.Message
+	if cached := s.respostaCache(env, chave); cached != nil {
+		resp = cached
+	} else {
+		resp = s.aplicarEscritaLocal(env, false, chave)
+		switch r := resp.(type) {
+		case *protos.LoginResponse:
+			if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return r
+			}
+		case *protos.CreateChannelResponse:
+			if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return r
+			}
+		case *protos.PublishResponse:
+			if r.GetStatus() != protos.Status_STATUS_SUCESSO {
+				return r
+			}
+		}
+		s.cacheRegistrarAplicada(chave, resp)
+	}
+
+	if replicaErr := s.replicarEscrita(env, chave); replicaErr != nil {
 		return replicaErr
 	}
+	s.cacheMarcarConcluida(chave)
 	return resp
 }
 
