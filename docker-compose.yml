@@ -40,6 +40,7 @@ services:
       - REFERENCE_ENDPOINT=tcp://referencia:5559
       - SERVER_NAME=servidor_python
       - DATA_DIR=/data
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     volumes:
       - ./dados/servidor_python:/data
     depends_on:
@@ -75,6 +76,7 @@ services:
       - REFERENCE_ENDPOINT=tcp://referencia:5559
       - SERVER_NAME=servidor_go
       - DATA_DIR=/data
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     volumes:
       - ./dados/servidor_go:/data
     depends_on:
@@ -110,6 +112,7 @@ services:
       - REFERENCE_ENDPOINT=tcp://referencia:5559
       - SERVER_NAME=servidor_java
       - DATA_DIR=/data
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     volumes:
       - ./dados/servidor_java:/data
     depends_on:
@@ -144,6 +147,7 @@ services:
       - REFERENCE_ENDPOINT=tcp://referencia:5559
       - SERVER_NAME=servidor_csharp
       - DATA_DIR=/data
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     volumes:
       - ./dados/servidor_csharp:/data
     depends_on:

@@ -36,12 +36,18 @@ CLOCK_PORT = 5560
 ELECTION_PORT = 5561
 REQUEST_TIMEOUT_MS = 2000
 ANNOUNCEMENT_TIMEOUT_SECONDS = 3.0
-STARTUP_ELECTION_DELAY_SECONDS = 0.2
+MAINTENANCE_INTERVAL_SECONDS = float(os.getenv("SERVER_MAINTENANCE_INTERVAL_SECONDS", "5"))
 TOPICO_COORDENADOR = "servers"
+LOG_MODE = os.getenv("SERVER_LOG_MODE", "presentation").strip().lower() or "presentation"
 
 LOGINS_PATH = DATA_DIR / "logins.jsonl"
 CANAIS_PATH = DATA_DIR / "canais.json"
 PUBLICACOES_PATH = DATA_DIR / "publicacoes.jsonl"
+
+
+def _log_verbose(message: str, *args: object) -> None:
+    if LOG_MODE == "verbose":
+        logging.info(message, *args)
 
 
 class Servidor:
@@ -65,23 +71,22 @@ class Servidor:
         self.origem = origem_label("servidor")
         self.requests_processadas = 0
         self._lock = threading.RLock()
+        self._reference_lock = threading.Lock()
         self._coordinator_name = ""
         self._coordinator_version = 0
         self._active_servers: dict[str, int] = {}
         self._my_rank = 0
         self._election_running = False
-        logging.info("Servidor conectado ao orquestrador em %s", ORQ_ENDPOINT)
-        logging.info("Servidor conectado ao proxy pub em %s", PROXY_PUB_ENDPOINT)
-        logging.info("Servidor conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
-        logging.info("Servidor conectado à referência em %s", REFERENCE_ENDPOINT)
+        _log_verbose("Servidor conectado ao orquestrador em %s", ORQ_ENDPOINT)
+        _log_verbose("Servidor conectado ao proxy pub em %s", PROXY_PUB_ENDPOINT)
+        _log_verbose("Servidor conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
+        _log_verbose("Servidor conectado à referência em %s", REFERENCE_ENDPOINT)
         self._init_storage()
         self._registrar_na_referencia()
         servidores = self._listar_servidores_referencia()
         self._atualizar_servidores_ativos(servidores)
         self._definir_coordenador_tentativo(servidores)
         self._iniciar_servicos_internos()
-        time.sleep(STARTUP_ELECTION_DELAY_SECONDS)
-        self._executar_eleicao("startup")
         logging.info(
             "Servidor pronto. Rank local=%s coordenador=%s",
             self._my_rank,
@@ -130,17 +135,18 @@ class Servidor:
         self, env: contrato_pb2.Envelope, atualizar_offset: bool = True
     ) -> tuple[contrato_pb2.Envelope, int, int]:
         tipo = env.WhichOneof("conteudo") or "desconhecido"
-        logging.info("Enviando %s para referência %s", tipo, cabecalho_texto(env.cabecalho))
+        _log_verbose("Enviando %s para referência %s", tipo, cabecalho_texto(env.cabecalho))
         envio_ns = time.time_ns()
         try:
-            self.reference_socket.send(envelope_bytes(env))
-            data = self.reference_socket.recv()
+            with self._reference_lock:
+                self.reference_socket.send(envelope_bytes(env))
+                data = self.reference_socket.recv()
         except zmq.Again as exc:
             raise TimeoutError("timeout ao comunicar com a referência") from exc
         recebimento_ns = time.time_ns()
         resp_env = envelope_from_bytes(data)
         self.relogio.on_receive(resp_env.cabecalho.relogio_logico)
-        logging.info(
+        _log_verbose(
             "Recebido %s da referência %s",
             resp_env.WhichOneof("conteudo") or "desconhecido",
             cabecalho_texto(resp_env.cabecalho),
@@ -167,7 +173,7 @@ class Servidor:
         self._atualizar_servidores_ativos(
             [contrato_pb2.ServerInfo(nome=SERVER_NAME, rank=self._my_rank)]
         )
-        logging.info("Servidor %s registrado na referência com rank=%s", SERVER_NAME, res.rank)
+        _log_verbose("Servidor %s registrado na referência com rank=%s", SERVER_NAME, res.rank)
 
     def _listar_servidores_referencia(self) -> list[contrato_pb2.ServerInfo]:
         env = contrato_pb2.Envelope()
@@ -183,7 +189,7 @@ class Servidor:
 
         servidores = list(resp_env.list_servers_res.servidores)
         resumo = ", ".join(f"{item.nome}(rank={item.rank})" for item in servidores) or "(nenhum)"
-        logging.info("Servidores disponíveis na referência: %s", resumo)
+        _log_verbose("Servidores disponíveis na referência: %s", resumo)
         self._atualizar_servidores_ativos(servidores)
         return servidores
 
@@ -205,8 +211,9 @@ class Servidor:
             logging.warning("Falha ao enviar heartbeat: %s", res.erro_msg)
             return
 
-        logging.info("Heartbeat enviado com sucesso para %s", SERVER_NAME)
+        _log_verbose("Heartbeat enviado com sucesso para %s", SERVER_NAME)
         servidores = self._listar_servidores_referencia()
+        self._atualizar_coordenador_tentativo()
         if self._coordenador_atual() and self._coordenador_atual() not in {item.nome for item in servidores}:
             logging.warning(
                 "Coordenador %s ausente da lista ativa; iniciando eleição",
@@ -215,13 +222,13 @@ class Servidor:
             self._iniciar_eleicao_async("coordenador ausente da lista ativa")
 
     def loop(self) -> None:
-        logging.info("Servidor iniciado. Aguardando mensagens...")
+        _log_verbose("Servidor iniciado. Aguardando mensagens...")
         while True:
             data = self.socket.recv()
             env = envelope_from_bytes(data)
             self.relogio.on_receive(env.cabecalho.relogio_logico)
             tipo = env.WhichOneof("conteudo")
-            logging.info("Recebido %s %s", tipo, cabecalho_texto(env.cabecalho))
+            _log_verbose("Recebido %s %s", tipo, cabecalho_texto(env.cabecalho))
 
             if tipo == "login_req":
                 resp = self._processar_login(env.login_req)
@@ -252,7 +259,7 @@ class Servidor:
                 resp.cabecalho.CopyFrom(cab)
                 resp_env.publish_res.CopyFrom(resp)
 
-            logging.info("Enviando %s %s", resp_env.WhichOneof("conteudo"), cabecalho_texto(resp_env.cabecalho))
+            _log_verbose("Enviando %s %s", resp_env.WhichOneof("conteudo"), cabecalho_texto(resp_env.cabecalho))
             self.socket.send(envelope_bytes(resp_env))
 
             self.requests_processadas += 1
@@ -335,7 +342,7 @@ class Servidor:
         channel_msg.timestamp_envio.CopyFrom(cab_publicacao.timestamp_envio)
         channel_msg.relogio_logico = cab_publicacao.relogio_logico
 
-        logging.info("Publicando em %s ts=%s relogio=%s", canal, timestamp_to_text(channel_msg.timestamp_envio), channel_msg.relogio_logico)
+        _log_verbose("Publicando em %s ts=%s relogio=%s", canal, timestamp_to_text(channel_msg.timestamp_envio), channel_msg.relogio_logico)
         self.pub_socket.send_multipart([canal.encode("utf-8"), channel_msg.SerializeToString()])
         self._registrar_publicacao(
             canal,
@@ -351,11 +358,20 @@ class Servidor:
         threading.Thread(target=self._loop_relogio, daemon=True).start()
         threading.Thread(target=self._loop_eleicao, daemon=True).start()
         threading.Thread(target=self._loop_anuncios_coord, daemon=True).start()
+        threading.Thread(target=self._loop_manutencao_referencia, daemon=True).start()
+
+    def _loop_manutencao_referencia(self) -> None:
+        while True:
+            time.sleep(MAINTENANCE_INTERVAL_SECONDS)
+            try:
+                self._heartbeat_e_sincronizar()
+            except Exception as exc:
+                logging.warning("Erro na manutenção periódica da referência: %s", exc)
 
     def _loop_relogio(self) -> None:
         socket = self.context.socket(zmq.REP)
         socket.bind(f"tcp://*:{CLOCK_PORT}")
-        logging.info("Serviço de relógio interno ouvindo em tcp://*:%s", CLOCK_PORT)
+        _log_verbose("Serviço de relógio interno ouvindo em tcp://*:%s", CLOCK_PORT)
         while True:
             try:
                 data = socket.recv()
@@ -383,7 +399,7 @@ class Servidor:
     def _loop_eleicao(self) -> None:
         socket = self.context.socket(zmq.REP)
         socket.bind(f"tcp://*:{ELECTION_PORT}")
-        logging.info("Serviço de eleição interno ouvindo em tcp://*:%s", ELECTION_PORT)
+        _log_verbose("Serviço de eleição interno ouvindo em tcp://*:%s", ELECTION_PORT)
         while True:
             try:
                 data = socket.recv()
@@ -409,7 +425,7 @@ class Servidor:
                 logging.warning("Erro no serviço interno de eleição: %s", exc)
 
     def _loop_anuncios_coord(self) -> None:
-        logging.info("Escutando anúncios de coordenador no tópico '%s'", TOPICO_COORDENADOR)
+        _log_verbose("Escutando anúncios de coordenador no tópico '%s'", TOPICO_COORDENADOR)
         while True:
             try:
                 topico, payload = self.sub_socket.recv_multipart()
@@ -424,9 +440,13 @@ class Servidor:
                 if not coordenador:
                     continue
 
+                remetente = msg.remetente.strip()
+                if remetente == SERVER_NAME and coordenador == SERVER_NAME:
+                    continue
+
                 self._set_coordenador(
                     coordenador,
-                    f"anúncio publicado por {msg.remetente or 'desconhecido'}",
+                    f"anúncio publicado por {remetente or 'desconhecido'}",
                     incrementar_versao=True,
                 )
                 logging.info(
@@ -460,7 +480,7 @@ class Servidor:
             if self._my_rank:
                 self._active_servers[SERVER_NAME] = self._my_rank
 
-        logging.info(
+        _log_verbose(
             "Lista ativa local atualizada: %s",
             self._resumo_servidores(self._servidores_ativos_snapshot()),
         )
@@ -505,13 +525,27 @@ class Servidor:
         candidato = self._maior_servidor_ativo()
         self._set_coordenador(candidato, "coordenador tentativo inicial", incrementar_versao=False)
 
+    def _atualizar_coordenador_tentativo(self) -> None:
+        with self._lock:
+            if self._election_running or self._coordinator_version > 0:
+                return
+            candidato = self._maior_servidor_ativo()
+            atual = self._coordinator_name
+
+        if candidato and candidato != atual:
+            self._set_coordenador(
+                candidato,
+                "coordenador tentativo atualizado pela lista ativa",
+                incrementar_versao=False,
+            )
+
     def _is_coordenador(self) -> bool:
         return self._coordenador_atual() == SERVER_NAME
 
     def _iniciar_eleicao_async(self, motivo: str) -> None:
         with self._lock:
             if self._election_running:
-                logging.info("Eleição já em andamento; ignorando novo gatilho (%s)", motivo)
+                _log_verbose("Eleição já em andamento; ignorando novo gatilho (%s)", motivo)
                 return
             self._election_running = True
 
@@ -626,7 +660,7 @@ class Servidor:
         req.nome_servidor = SERVER_NAME
         env.heartbeat_req.CopyFrom(req)
 
-        logging.info(
+        _log_verbose(
             "Enviando heartbeat_req para %s %s",
             nome_servidor,
             cabecalho_texto(env.cabecalho),
@@ -645,7 +679,7 @@ class Servidor:
                 resp_env.heartbeat_res.erro_msg,
             )
             return None
-        logging.info(
+        _log_verbose(
             "Recebido heartbeat_res de %s %s",
             nome_servidor,
             cabecalho_texto(resp_env.cabecalho),
@@ -660,7 +694,7 @@ class Servidor:
         req.nome_servidor = SERVER_NAME
         env.register_server_req.CopyFrom(req)
 
-        logging.info(
+        _log_verbose(
             "Enviando pedido de eleição para %s %s",
             nome_servidor,
             cabecalho_texto(env.cabecalho),
@@ -715,7 +749,7 @@ class Servidor:
             envio_ns,
             recebimento_ns,
         )
-        logging.info(
+        _log_verbose(
             "Offset físico atualizado para %.3f ms usando coordenador %s",
             self.relogio.offset_ms(),
             coordenador,
@@ -741,7 +775,7 @@ class Servidor:
         media_ns = sum(amostras) // len(amostras)
         agora_ns = time.time_ns()
         self.relogio.atualizar_offset(timestamp_from_ns(media_ns), agora_ns, agora_ns)
-        logging.info(
+        _log_verbose(
             "Berkeley aplicado pelo coordenador %s com participantes=%s falhas=%s media=%s offset=%.3f ms",
             SERVER_NAME,
             ", ".join(participantes),
@@ -794,17 +828,17 @@ class Servidor:
 
         if self._is_coordenador():
             resposta.status = contrato_pb2.STATUS_SUCESSO
-            logging.info("Respondendo relógio ao servidor %s como coordenador", solicitante)
+            _log_verbose("Respondendo relógio ao servidor %s como coordenador", solicitante)
             return resposta
 
         if solicitante == coordenador and coordenador:
             resposta.status = contrato_pb2.STATUS_SUCESSO
-            logging.info("Respondendo relógio ao coordenador %s", solicitante)
+            _log_verbose("Respondendo relógio ao coordenador %s", solicitante)
             return resposta
 
         resposta.status = contrato_pb2.STATUS_ERRO
         resposta.erro_msg = "nao sou coordenador"
-        logging.info(
+        _log_verbose(
             "Pedido de relógio de %s rejeitado; coordenador atual=%s",
             solicitante,
             coordenador or "(desconhecido)",

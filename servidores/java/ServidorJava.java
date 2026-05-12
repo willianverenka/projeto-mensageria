@@ -22,7 +22,8 @@ public class ServidorJava {
   private static final int ELECTION_PORT = 5561;
   private static final int REQUEST_TIMEOUT_MS = 2000;
   private static final int ANNOUNCEMENT_TIMEOUT_MS = 3000;
-  private static final int STARTUP_DELAY_MS = 200;
+  private static final int MAINTENANCE_INTERVAL_MS = 5000;
+  private static final String LOG_MODE = getEnv("SERVER_LOG_MODE", "presentation").trim().toLowerCase();
 
   private final ZMQ.Context context;
   private final ZMQ.Socket socket;
@@ -38,6 +39,7 @@ public class ServidorJava {
   private final String serverName;
   private final RelogioProcesso relogio = new RelogioProcesso();
   private final Object stateLock = new Object();
+  private final Object referenceLock = new Object();
   private final Map<String, Integer> servidoresAtivos = new HashMap<>();
 
   private int requestsProcessadas = 0;
@@ -47,6 +49,16 @@ public class ServidorJava {
   private boolean electionRunning = false;
 
   private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+
+  private static boolean isVerbose() {
+    return "verbose".equals(LOG_MODE);
+  }
+
+  private static void logVerbose(String message) {
+    if (isVerbose()) {
+      System.out.println(message);
+    }
+  }
 
   public ServidorJava(
       String orqEndpoint,
@@ -76,17 +88,15 @@ public class ServidorJava {
     this.canaisPath = this.dataDir.resolve("canais.json");
     this.publicacoesPath = this.dataDir.resolve("publicacoes.jsonl");
 
-    System.out.println("[SERVIDOR] Conectado ao orquestrador em " + orqEndpoint);
-    System.out.println("[SERVIDOR] Conectado ao proxy pub em " + proxyPubEndpoint);
-    System.out.println("[SERVIDOR] Conectado ao proxy sub em " + proxySubEndpoint);
-    System.out.println("[SERVIDOR] Conectado à referência em " + referenceEndpoint);
+    logVerbose("[SERVIDOR] Conectado ao orquestrador em " + orqEndpoint);
+    logVerbose("[SERVIDOR] Conectado ao proxy pub em " + proxyPubEndpoint);
+    logVerbose("[SERVIDOR] Conectado ao proxy sub em " + proxySubEndpoint);
+    logVerbose("[SERVIDOR] Conectado à referência em " + referenceEndpoint);
     initStorage();
     registrarNaReferencia();
     List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
     definirCoordenadorTentativo(servidores);
     iniciarServicosInternos();
-    Thread.sleep(STARTUP_DELAY_MS);
-    executarEleicao("startup");
     System.out.println("[SERVIDOR] Servidor pronto. Rank local=" + meuRank + " coordenador=" + coordenadorAtual());
   }
 
@@ -105,17 +115,20 @@ public class ServidorJava {
   }
 
   private Contrato.Envelope enviarParaReferencia(Contrato.Envelope env) throws Exception {
-    System.out.println(
+    logVerbose(
         "[SERVIDOR] Enviando " + env.getConteudoCase() + " para referência " + Mensageria.cabecalhoTexto(env.getCabecalho())
     );
-    refSocket.send(Mensageria.envelopeBytes(env), 0);
-    byte[] reply = refSocket.recv(0);
+    byte[] reply;
+    synchronized (referenceLock) {
+      refSocket.send(Mensageria.envelopeBytes(env), 0);
+      reply = refSocket.recv(0);
+    }
     if (reply == null) {
       throw new IllegalStateException("Resposta nula da referência.");
     }
     Contrato.Envelope resp = Mensageria.envelopeFromBytes(reply);
     relogio.onReceive(resp.getCabecalho().getRelogioLogico());
-    System.out.println(
+    logVerbose(
         "[SERVIDOR] Recebido " + resp.getConteudoCase() + " da referência " + Mensageria.cabecalhoTexto(resp.getCabecalho())
     );
     return resp;
@@ -147,7 +160,7 @@ public class ServidorJava {
             .setRank(meuRank)
             .build()
     ));
-    System.out.println("[SERVIDOR] Servidor " + serverName + " registrado na referência com rank=" + res.getRank());
+    logVerbose("[SERVIDOR] Servidor " + serverName + " registrado na referência com rank=" + res.getRank());
   }
 
   private List<Contrato.ServerInfo> listarServidoresReferencia() throws Exception {
@@ -167,13 +180,13 @@ public class ServidorJava {
     List<Contrato.ServerInfo> servidores = new ArrayList<>(resp.getListServersRes().getServidoresList());
     atualizarServidoresAtivos(servidores);
     if (servidores.isEmpty()) {
-      System.out.println("[SERVIDOR] Servidores disponíveis na referência: (nenhum)");
+      logVerbose("[SERVIDOR] Servidores disponíveis na referência: (nenhum)");
     } else {
       List<String> partes = new ArrayList<>();
       for (Contrato.ServerInfo servidor : servidores) {
         partes.add(servidor.getNome() + "(rank=" + servidor.getRank() + ")");
       }
-      System.out.println("[SERVIDOR] Servidores disponíveis na referência: " + String.join(", ", partes));
+      logVerbose("[SERVIDOR] Servidores disponíveis na referência: " + String.join(", ", partes));
     }
     return servidores;
   }
@@ -198,8 +211,9 @@ public class ServidorJava {
       System.err.println("[SERVIDOR] Heartbeat rejeitado: " + res.getErroMsg());
       return;
     }
-    System.out.println("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
+    logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
     List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
+    atualizarCoordenadorTentativo();
     String coordenador = coordenadorAtual();
     boolean encontrado = false;
     for (Contrato.ServerInfo servidor : servidores) {
@@ -365,7 +379,7 @@ public class ServidorJava {
         .setRelogioLogico(cabPub.getRelogioLogico())
         .build();
 
-    System.out.println(
+    logVerbose(
         "[SERVIDOR] Publicando em " + canal
             + " ts=" + Mensageria.timestampTexto(channelMessage.getTimestampEnvio())
             + " relogio=" + channelMessage.getRelogioLogico()
@@ -391,12 +405,27 @@ public class ServidorJava {
     Thread announcementThread = new Thread(this::loopAnunciosCoordenador, "servidor-java-announcements");
     announcementThread.setDaemon(true);
     announcementThread.start();
+
+    Thread maintenanceThread = new Thread(this::loopManutencaoReferencia, "servidor-java-maintenance");
+    maintenanceThread.setDaemon(true);
+    maintenanceThread.start();
+  }
+
+  private void loopManutencaoReferencia() {
+    while (true) {
+      try {
+        Thread.sleep(MAINTENANCE_INTERVAL_MS);
+        heartbeatESincronizar();
+      } catch (Exception e) {
+        System.out.println("[SERVIDOR] Erro na manutenção periódica da referência: " + e.getMessage());
+      }
+    }
   }
 
   private void loopRelogio() {
     try (ZMQ.Socket sock = context.socket(ZMQ.REP)) {
       sock.bind("tcp://*:" + CLOCK_PORT);
-      System.out.println("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:" + CLOCK_PORT);
+      logVerbose("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:" + CLOCK_PORT);
       while (true) {
         byte[] data = sock.recv(0);
         if (data == null) {
@@ -437,7 +466,7 @@ public class ServidorJava {
   private void loopEleicao() {
     try (ZMQ.Socket sock = context.socket(ZMQ.REP)) {
       sock.bind("tcp://*:" + ELECTION_PORT);
-      System.out.println("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:" + ELECTION_PORT);
+      logVerbose("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:" + ELECTION_PORT);
       while (true) {
         byte[] data = sock.recv(0);
         if (data == null) {
@@ -476,7 +505,7 @@ public class ServidorJava {
   }
 
   private void loopAnunciosCoordenador() {
-    System.out.println("[SERVIDOR] Escutando anúncios de coordenador no tópico " + TOPICO_COORDENADOR);
+    logVerbose("[SERVIDOR] Escutando anúncios de coordenador no tópico " + TOPICO_COORDENADOR);
     while (true) {
       try {
         byte[] topicBytes = subSocket.recv(0);
@@ -492,7 +521,14 @@ public class ServidorJava {
         if (coordenador.isEmpty()) {
           continue;
         }
-        setCoordenador(coordenador, "anúncio publicado por " + channelMessage.getRemetente(), true);
+        String remetente = channelMessage.getRemetente().trim();
+        if (remetente.equals(serverName) && coordenador.equals(serverName)) {
+          continue;
+        }
+        if (remetente.isEmpty()) {
+          remetente = "desconhecido";
+        }
+        setCoordenador(coordenador, "anúncio publicado por " + remetente, true);
         System.out.println("[SERVIDOR] Anúncio de coordenador recebido em " + topic + ": " + coordenador);
       } catch (Exception e) {
         System.out.println("[SERVIDOR] Erro ao ler anúncios de coordenador: " + e.getMessage());
@@ -540,7 +576,7 @@ public class ServidorJava {
         servidoresAtivos.put(serverName, meuRank);
       }
     }
-    System.out.println("[SERVIDOR] Lista ativa local atualizada: " + resumoServidores(servidoresAtivosSnapshot()));
+    logVerbose("[SERVIDOR] Lista ativa local atualizada: " + resumoServidores(servidoresAtivosSnapshot()));
   }
 
   private String maiorServidorAtivo() {
@@ -590,6 +626,21 @@ public class ServidorJava {
     setCoordenador(candidato, "coordenador tentativo inicial", false);
   }
 
+  private void atualizarCoordenadorTentativo() {
+    String atual;
+    synchronized (stateLock) {
+      if (electionRunning || coordenadorVersao > 0) {
+        return;
+      }
+      atual = coordenadorAtual;
+    }
+
+    String candidato = maiorServidorAtivo();
+    if (!candidato.isEmpty() && !candidato.equals(atual)) {
+      setCoordenador(candidato, "coordenador tentativo atualizado pela lista ativa", false);
+    }
+  }
+
   private boolean isCoordenador() {
     return serverName.equals(coordenadorAtual());
   }
@@ -603,7 +654,7 @@ public class ServidorJava {
   private void executarEleicao(String motivo) {
     synchronized (stateLock) {
       if (electionRunning) {
-        System.out.println("[SERVIDOR] Eleição já em andamento; ignorando gatilho (" + motivo + ")");
+        logVerbose("[SERVIDOR] Eleição já em andamento; ignorando gatilho (" + motivo + ")");
         return;
       }
       electionRunning = true;
@@ -740,7 +791,7 @@ public class ServidorJava {
         .setCabecalho(cab)
         .setHeartbeatReq(req)
         .build();
-    System.out.println("[SERVIDOR] Enviando heartbeat_req para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
+    logVerbose("[SERVIDOR] Enviando heartbeat_req para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
     PeerReply reply = enviarParaServidor(nomeServidor, CLOCK_PORT, env, REQUEST_TIMEOUT_MS);
     if (reply == null) {
       System.out.println("[SERVIDOR] Sem resposta de relógio de " + nomeServidor);
@@ -755,7 +806,7 @@ public class ServidorJava {
       System.out.println("[SERVIDOR] Servidor " + nomeServidor + " rejeitou pedido de relógio: " + resposta.getErroMsg());
       return null;
     }
-    System.out.println("[SERVIDOR] Recebido heartbeat_res de " + nomeServidor + " " + Mensageria.cabecalhoTexto(reply.envelope.getCabecalho()));
+    logVerbose("[SERVIDOR] Recebido heartbeat_res de " + nomeServidor + " " + Mensageria.cabecalhoTexto(reply.envelope.getCabecalho()));
     return reply;
   }
 
@@ -769,7 +820,7 @@ public class ServidorJava {
         .setCabecalho(cab)
         .setRegisterServerReq(req)
         .build();
-    System.out.println("[SERVIDOR] Enviando pedido de eleição para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
+    logVerbose("[SERVIDOR] Enviando pedido de eleição para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
     PeerReply reply = enviarParaServidor(nomeServidor, ELECTION_PORT, env, REQUEST_TIMEOUT_MS);
     if (reply == null) {
       System.out.println("[SERVIDOR] Sem resposta de eleição de " + nomeServidor);
@@ -804,7 +855,7 @@ public class ServidorJava {
     }
 
     relogio.atualizarOffset(reply.envelope.getCabecalho().getTimestampEnvio(), reply.envioNs, reply.recebimentoNs);
-    System.out.println("[SERVIDOR] Offset físico atualizado para " + relogio.offsetMillis() + " ms usando coordenador " + coordenador);
+    logVerbose("[SERVIDOR] Offset físico atualizado para " + relogio.offsetMillis() + " ms usando coordenador " + coordenador);
     return true;
   }
 
@@ -842,7 +893,7 @@ public class ServidorJava {
     long mediaNs = soma / amostras.size();
     long agoraNs = Mensageria.agoraNs();
     relogio.atualizarOffset(Mensageria.timestampFromNs(mediaNs), agoraNs, agoraNs);
-    System.out.println(
+    logVerbose(
         "[SERVIDOR] Berkeley aplicado pelo coordenador " + serverName
             + " com participantes=" + String.join(", ", participantes)
             + " falhas=" + String.join(", ", falhas)
@@ -908,19 +959,19 @@ public class ServidorJava {
     String coordenador = coordenadorAtual();
     if (isCoordenador()) {
       resposta.setStatus(Contrato.Status.STATUS_SUCESSO);
-      System.out.println("[SERVIDOR] Respondendo relógio ao servidor " + solicitante + " como coordenador");
+      logVerbose("[SERVIDOR] Respondendo relógio ao servidor " + solicitante + " como coordenador");
       return resposta.build();
     }
 
     if (!coordenador.isEmpty() && solicitante.equals(coordenador)) {
       resposta.setStatus(Contrato.Status.STATUS_SUCESSO);
-      System.out.println("[SERVIDOR] Respondendo relógio ao coordenador " + solicitante);
+      logVerbose("[SERVIDOR] Respondendo relógio ao coordenador " + solicitante);
       return resposta.build();
     }
 
     resposta.setStatus(Contrato.Status.STATUS_ERRO);
     resposta.setErroMsg("nao sou coordenador");
-    System.out.println("[SERVIDOR] Pedido de relógio de " + solicitante + " rejeitado; coordenador atual=" + coordenador);
+    logVerbose("[SERVIDOR] Pedido de relógio de " + solicitante + " rejeitado; coordenador atual=" + coordenador);
     return resposta.build();
   }
 
@@ -968,7 +1019,7 @@ public class ServidorJava {
   }
 
   public void loop() throws Exception {
-    System.out.println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...");
+    logVerbose("[SERVIDOR] Servidor iniciado. Aguardando mensagens...");
     while (true) {
       byte[] data = socket.recv(0);
       if (data == null) {
@@ -985,7 +1036,7 @@ public class ServidorJava {
 
       relogio.onReceive(env.getCabecalho().getRelogioLogico());
       Contrato.Envelope.ConteudoCase tipo = env.getConteudoCase();
-      System.out.println("[SERVIDOR] Recebido " + tipo + " " + Mensageria.cabecalhoTexto(env.getCabecalho()));
+      logVerbose("[SERVIDOR] Recebido " + tipo + " " + Mensageria.cabecalhoTexto(env.getCabecalho()));
 
       Object resposta = switch (tipo) {
         case LOGIN_REQ -> processarLogin(env.getLoginReq());
@@ -1013,7 +1064,7 @@ public class ServidorJava {
         respEnv.setPublishRes(pr.toBuilder().setCabecalho(outerCab).build());
       }
 
-      System.out.println("[SERVIDOR] Enviando " + respEnv.getConteudoCase() + " " + Mensageria.cabecalhoTexto(outerCab));
+      logVerbose("[SERVIDOR] Enviando " + respEnv.getConteudoCase() + " " + Mensageria.cabecalhoTexto(outerCab));
       socket.send(Mensageria.envelopeBytes(respEnv.build()), 0);
 
       requestsProcessadas += 1;

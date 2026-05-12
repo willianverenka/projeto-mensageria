@@ -20,18 +20,32 @@ import (
 )
 
 const (
-	orqEndpointDefault = "tcp://orquestrador:5556"
-	proxyPubEndpoint   = "tcp://proxy:5557"
-	proxySubEndpoint   = "tcp://proxy:5558"
-	referenceEndpoint  = "tcp://referencia:5559"
-	dataDirDefault     = "/data"
-	clockPort          = 5560
-	electionPort       = 5561
-	requestTimeout     = 2 * time.Second
-	announcementDelay  = 3 * time.Second
-	startupDelay       = 200 * time.Millisecond
-	topicoCoordenador  = "servers"
+	orqEndpointDefault  = "tcp://orquestrador:5556"
+	proxyPubEndpoint    = "tcp://proxy:5557"
+	proxySubEndpoint    = "tcp://proxy:5558"
+	referenceEndpoint   = "tcp://referencia:5559"
+	dataDirDefault      = "/data"
+	clockPort           = 5560
+	electionPort        = 5561
+	requestTimeout      = 2 * time.Second
+	announcementDelay   = 3 * time.Second
+	maintenanceInterval = 5 * time.Second
+	topicoCoordenador   = "servers"
 )
+
+var logMode = strings.ToLower(strings.TrimSpace(getEnv("SERVER_LOG_MODE", "presentation")))
+
+func init() {
+	if logMode == "" {
+		logMode = "presentation"
+	}
+}
+
+func logVerbose(format string, args ...any) {
+	if logMode == "verbose" {
+		log.Printf(format, args...)
+	}
+}
 
 func main() {
 	orqEndpoint := getEnv("ORQ_ENDPOINT_SERVIDOR", orqEndpointDefault)
@@ -49,7 +63,7 @@ func main() {
 	if err := sock.Connect(orqEndpoint); err != nil {
 		log.Fatalf("Conectar ao orquestrador: %v", err)
 	}
-	log.Printf("[SERVIDOR] Conectado ao orquestrador em %s", orqEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao orquestrador em %s", orqEndpoint)
 
 	server := &Servidor{
 		sock:              sock,
@@ -69,17 +83,15 @@ func main() {
 	defer server.announceSock.Close()
 	defer server.refSock.Close()
 	defer server.subSock.Close()
-	log.Printf("[SERVIDOR] Conectado ao proxy pub em %s", pubEndpoint)
-	log.Printf("[SERVIDOR] Conectado ao proxy sub em %s", proxySubEndpoint)
-	log.Printf("[SERVIDOR] Conectado à referência em %s", refEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao proxy pub em %s", pubEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao proxy sub em %s", proxySubEndpoint)
+	logVerbose("[SERVIDOR] Conectado à referência em %s", refEndpoint)
 	server.initStorage()
 	server.registrarNaReferencia()
 	servidores := server.listarServidoresReferencia()
 	server.atualizarServidoresAtivos(servidores)
 	server.definirCoordenadorTentativo(servidores)
 	server.iniciarServicosInternos()
-	time.Sleep(startupDelay)
-	server.executarEleicao("startup")
 	log.Printf("[SERVIDOR] Servidor pronto. Rank local=%d coordenador=%s", server.myRank, server.coordenadorAtual())
 	server.loop()
 }
@@ -98,6 +110,7 @@ type Servidor struct {
 	announceSock      *zmq4.Socket
 	subSock           *zmq4.Socket
 	stateMu           sync.RWMutex
+	refMu             sync.Mutex
 	coordenador       string
 	coordenadorVersao int64
 	activeServers     map[string]int32
@@ -241,7 +254,7 @@ func (s *Servidor) registrarNaReferencia() {
 	}
 	s.myRank = res.RegisterServerRes.GetRank()
 	s.atualizarServidoresAtivos([]*protos.ServerInfo{{Nome: s.serverName, Rank: s.myRank}})
-	log.Printf("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
+	logVerbose("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
 }
 
 func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
@@ -272,7 +285,7 @@ func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
 	if len(partes) == 0 {
 		partes = append(partes, "(nenhum)")
 	}
-	log.Printf("[SERVIDOR] Servidores disponíveis na referência: %s", strings.Join(partes, ", "))
+	logVerbose("[SERVIDOR] Servidores disponíveis na referência: %s", strings.Join(partes, ", "))
 	s.atualizarServidoresAtivos(servidores)
 	return servidores
 }
@@ -298,8 +311,9 @@ func (s *Servidor) heartbeatESincronizar() {
 		log.Printf("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
 		return
 	}
-	log.Printf("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
+	logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
 	servidores := s.listarServidoresReferencia()
+	s.atualizarCoordenadorTentativo()
 	if coordenador := s.coordenadorAtual(); coordenador != "" {
 		encontrado := false
 		for _, servidor := range servidores {
@@ -320,8 +334,10 @@ func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bo
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[SERVIDOR] Enviando %s para referência %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
+	logVerbose("[SERVIDOR] Enviando %s para referência %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 	envioNs := time.Now().UnixNano()
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
 	if _, err := s.refSock.SendBytes(data, 0); err != nil {
 		return nil, err
 	}
@@ -335,7 +351,7 @@ func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bo
 		return nil, err
 	}
 	s.clock.OnReceive(resp.GetCabecalho().GetRelogioLogico())
-	log.Printf("[SERVIDOR] Recebido %s da referência %s", conteudoNome(resp), mensageria.CabecalhoTexto(resp.GetCabecalho()))
+	logVerbose("[SERVIDOR] Recebido %s da referência %s", conteudoNome(resp), mensageria.CabecalhoTexto(resp.GetCabecalho()))
 	_ = envioNs
 	_ = recebimentoNs
 	return resp, nil
@@ -386,7 +402,7 @@ func (s *Servidor) registrarPublicacao(canal, mensagem, remetente, timestampISO 
 }
 
 func (s *Servidor) loop() {
-	log.Println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
+	logVerbose("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
 	for {
 		data, err := s.sock.RecvBytes(0)
 		if err != nil {
@@ -400,7 +416,7 @@ func (s *Servidor) loop() {
 		}
 
 		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
-		log.Printf("[SERVIDOR] Recebido %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
+		logVerbose("[SERVIDOR] Recebido %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 
 		conteudo := env.GetConteudo()
 		if conteudo == nil {
@@ -439,7 +455,7 @@ func (s *Servidor) loop() {
 			respEnv.Conteudo = &protos.Envelope_PublishRes{PublishRes: r}
 		}
 		respData, _ := proto.Marshal(respEnv)
-		log.Printf("[SERVIDOR] Enviando %s %s", conteudoNome(respEnv), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
+		logVerbose("[SERVIDOR] Enviando %s %s", conteudoNome(respEnv), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
 		if _, err := s.sock.SendBytes(respData, 0); err != nil {
 			log.Printf("[SERVIDOR] Send: %v", err)
 			continue
@@ -459,6 +475,15 @@ func (s *Servidor) iniciarServicosInternos() {
 	go s.loopRelogio()
 	go s.loopEleicao()
 	go s.loopAnunciosCoordenador()
+	go s.loopManutencaoReferencia()
+}
+
+func (s *Servidor) loopManutencaoReferencia() {
+	ticker := time.NewTicker(maintenanceInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.heartbeatESincronizar()
+	}
 }
 
 func mustBindReplySocket(port int) *zmq4.Socket {
@@ -475,7 +500,7 @@ func mustBindReplySocket(port int) *zmq4.Socket {
 func (s *Servidor) loopRelogio() {
 	sock := mustBindReplySocket(clockPort)
 	defer sock.Close()
-	log.Printf("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:%d", clockPort)
+	logVerbose("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:%d", clockPort)
 	for {
 		data, err := sock.RecvBytes(0)
 		if err != nil {
@@ -499,8 +524,8 @@ func (s *Servidor) loopRelogio() {
 			resposta = s.processarPedidoRelogio(c.HeartbeatReq)
 		default:
 			resposta = &protos.HeartbeatResponse{
-				Status:   protos.Status_STATUS_ERRO,
-				ErroMsg:  fmt.Sprintf("tipo não suportado: %T", c),
+				Status:    protos.Status_STATUS_ERRO,
+				ErroMsg:   fmt.Sprintf("tipo não suportado: %T", c),
 				Cabecalho: nil,
 			}
 		}
@@ -517,7 +542,7 @@ func (s *Servidor) loopRelogio() {
 func (s *Servidor) loopEleicao() {
 	sock := mustBindReplySocket(electionPort)
 	defer sock.Close()
-	log.Printf("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:%d", electionPort)
+	logVerbose("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:%d", electionPort)
 	for {
 		data, err := sock.RecvBytes(0)
 		if err != nil {
@@ -557,7 +582,7 @@ func (s *Servidor) loopEleicao() {
 }
 
 func (s *Servidor) loopAnunciosCoordenador() {
-	log.Printf("[SERVIDOR] Escutando anúncios de coordenador no tópico %s", topicoCoordenador)
+	logVerbose("[SERVIDOR] Escutando anúncios de coordenador no tópico %s", topicoCoordenador)
 	for {
 		msg, err := s.subSock.RecvMessageBytes(0)
 		if err != nil || len(msg) < 2 {
@@ -574,7 +599,14 @@ func (s *Servidor) loopAnunciosCoordenador() {
 		if coordenador == "" {
 			continue
 		}
-		s.setCoordenador(coordenador, fmt.Sprintf("anúncio publicado por %s", channelMsg.GetRemetente()), true)
+		remetente := strings.TrimSpace(channelMsg.GetRemetente())
+		if remetente == s.serverName && coordenador == s.serverName {
+			continue
+		}
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		s.setCoordenador(coordenador, fmt.Sprintf("anúncio publicado por %s", remetente), true)
 		log.Printf("[SERVIDOR] Anúncio de coordenador recebido em servers: %s", coordenador)
 	}
 }
@@ -618,7 +650,7 @@ func (s *Servidor) atualizarServidoresAtivos(servidores []*protos.ServerInfo) {
 	}
 	s.stateMu.Unlock()
 
-	log.Printf("[SERVIDOR] Lista ativa local atualizada: %s", s.resumoServidores(s.servidoresAtivosSnapshot()))
+	logVerbose("[SERVIDOR] Lista ativa local atualizada: %s", s.resumoServidores(s.servidoresAtivosSnapshot()))
 }
 
 func (s *Servidor) maiorServidorAtivo() string {
@@ -666,6 +698,21 @@ func (s *Servidor) definirCoordenadorTentativo(servidores []*protos.ServerInfo) 
 	s.setCoordenador(candidato, "coordenador tentativo inicial", false)
 }
 
+func (s *Servidor) atualizarCoordenadorTentativo() {
+	s.stateMu.RLock()
+	if s.electionRunning || s.coordenadorVersao > 0 {
+		s.stateMu.RUnlock()
+		return
+	}
+	atual := s.coordenador
+	s.stateMu.RUnlock()
+
+	candidato := s.maiorServidorAtivo()
+	if candidato != "" && candidato != atual {
+		s.setCoordenador(candidato, "coordenador tentativo atualizado pela lista ativa", false)
+	}
+}
+
 func (s *Servidor) isCoordenador() bool {
 	return s.coordenadorAtual() == s.serverName
 }
@@ -680,7 +727,7 @@ func (s *Servidor) executarEleicao(motivo string) {
 	s.stateMu.Lock()
 	if s.electionRunning {
 		s.stateMu.Unlock()
-		log.Printf("[SERVIDOR] Eleição já em andamento; ignorando gatilho (%s)", motivo)
+		logVerbose("[SERVIDOR] Eleição já em andamento; ignorando gatilho (%s)", motivo)
 		return
 	}
 	s.electionRunning = true
@@ -814,7 +861,7 @@ func (s *Servidor) consultarRelogioServidor(nomeServidor string) *protos.Envelop
 		Cabecalho: cab,
 		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
 	}
-	log.Printf("[SERVIDOR] Enviando heartbeat_req para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
+	logVerbose("[SERVIDOR] Enviando heartbeat_req para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
 	resp, _, _, err := s.enviarParaServidor(nomeServidor, clockPort, env, requestTimeout)
 	if err != nil {
 		log.Printf("[SERVIDOR] Sem resposta de relógio de %s: %v", nomeServidor, err)
@@ -830,7 +877,7 @@ func (s *Servidor) consultarRelogioServidor(nomeServidor string) *protos.Envelop
 		log.Printf("[SERVIDOR] Servidor %s rejeitou pedido de relógio: %s", nomeServidor, resposta.HeartbeatRes.GetErroMsg())
 		return nil
 	}
-	log.Printf("[SERVIDOR] Recebido heartbeat_res de %s %s", nomeServidor, mensageria.CabecalhoTexto(resp.GetCabecalho()))
+	logVerbose("[SERVIDOR] Recebido heartbeat_res de %s %s", nomeServidor, mensageria.CabecalhoTexto(resp.GetCabecalho()))
 	return resp
 }
 
@@ -841,7 +888,7 @@ func (s *Servidor) consultarEleicaoServidor(nomeServidor string) bool {
 		Cabecalho: cab,
 		Conteudo:  &protos.Envelope_RegisterServerReq{RegisterServerReq: req},
 	}
-	log.Printf("[SERVIDOR] Enviando pedido de eleição para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
+	logVerbose("[SERVIDOR] Enviando pedido de eleição para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
 	resp, _, _, err := s.enviarParaServidor(nomeServidor, electionPort, env, requestTimeout)
 	if err != nil {
 		log.Printf("[SERVIDOR] Sem resposta de eleição de %s: %v", nomeServidor, err)
@@ -884,7 +931,7 @@ func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
 	}
 
 	s.clock.AtualizarOffset(resp.GetCabecalho().GetTimestampEnvio(), envioNs, recebimentoNs)
-	log.Printf("[SERVIDOR] Offset físico atualizado para %.3f ms usando coordenador %s", s.clock.OffsetMillis(), coordenador)
+	logVerbose("[SERVIDOR] Offset físico atualizado para %.3f ms usando coordenador %s", s.clock.OffsetMillis(), coordenador)
 	return true
 }
 
@@ -919,7 +966,7 @@ func (s *Servidor) sincronizarComoCoordenador() {
 	mediaNs /= int64(len(amostras))
 	agoraNs := time.Now().UnixNano()
 	s.clock.AtualizarOffset(timestamppb.New(time.Unix(0, mediaNs).UTC()), agoraNs, agoraNs)
-	log.Printf(
+	logVerbose(
 		"[SERVIDOR] Berkeley aplicado pelo coordenador %s com participantes=%s falhas=%s media=%s offset=%.3f ms",
 		s.serverName,
 		strings.Join(participantes, ", "),
@@ -982,19 +1029,19 @@ func (s *Servidor) processarPedidoRelogio(req *protos.HeartbeatRequest) *protos.
 	coordenador := s.coordenadorAtual()
 	if s.isCoordenador() {
 		resposta.Status = protos.Status_STATUS_SUCESSO
-		log.Printf("[SERVIDOR] Respondendo relógio ao servidor %s como coordenador", solicitante)
+		logVerbose("[SERVIDOR] Respondendo relógio ao servidor %s como coordenador", solicitante)
 		return resposta
 	}
 
 	if solicitante == coordenador && coordenador != "" {
 		resposta.Status = protos.Status_STATUS_SUCESSO
-		log.Printf("[SERVIDOR] Respondendo relógio ao coordenador %s", solicitante)
+		logVerbose("[SERVIDOR] Respondendo relógio ao coordenador %s", solicitante)
 		return resposta
 	}
 
 	resposta.Status = protos.Status_STATUS_ERRO
 	resposta.ErroMsg = "nao sou coordenador"
-	log.Printf("[SERVIDOR] Pedido de relógio de %s rejeitado; coordenador atual=%s", solicitante, coordenador)
+	logVerbose("[SERVIDOR] Pedido de relógio de %s rejeitado; coordenador atual=%s", solicitante, coordenador)
 	return resposta
 }
 
@@ -1125,7 +1172,7 @@ func (s *Servidor) processarPublish(
 		res.ErroMsg = "erro ao serializar publicacao"
 		return res
 	}
-	log.Printf(
+	logVerbose(
 		"[SERVIDOR] Publicando em %s ts=%s relogio=%d",
 		canal,
 		mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()),

@@ -14,7 +14,9 @@ public class ServidorApp
     private const int ElectionPort = 5561;
     private const int RequestTimeoutMs = 2000;
     private const int AnnouncementTimeoutMs = 3000;
-    private const int StartupDelayMs = 200;
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(5);
+    private static readonly string LogMode =
+        (Environment.GetEnvironmentVariable("SERVER_LOG_MODE") ?? "presentation").Trim().ToLowerInvariant();
 
     private readonly string _orqEndpoint;
     private readonly string _proxyPubEndpoint;
@@ -32,6 +34,7 @@ public class ServidorApp
     private readonly RequestSocket _referenceSocket;
     private readonly SubscriberSocket _subSocket;
     private readonly object _stateLock = new();
+    private readonly object _referenceLock = new();
     private readonly RelogioProcesso _relogio = new();
     private readonly Dictionary<string, int> _servidoresAtivos = new();
     private string _coordenadorAtual = "";
@@ -39,6 +42,16 @@ public class ServidorApp
     private int _meuRank = 0;
     private bool _electionRunning = false;
     private int _requestsProcessadas = 0;
+
+    private static bool IsVerbose() => LogMode == "verbose";
+
+    private static void LogVerbose(string message)
+    {
+        if (IsVerbose())
+        {
+            Console.WriteLine(message);
+        }
+    }
 
     public ServidorApp()
     {
@@ -59,26 +72,24 @@ public class ServidorApp
 
         _socket = new DealerSocket();
         _socket.Connect(_orqEndpoint);
-        Console.WriteLine($"[SERVIDOR] Conectado ao orquestrador em {_orqEndpoint}");
+        LogVerbose($"[SERVIDOR] Conectado ao orquestrador em {_orqEndpoint}");
         _pubSocket = new PublisherSocket();
         _pubSocket.Connect(_proxyPubEndpoint);
-        Console.WriteLine($"[SERVIDOR] Conectado ao proxy pub em {_proxyPubEndpoint}");
+        LogVerbose($"[SERVIDOR] Conectado ao proxy pub em {_proxyPubEndpoint}");
         _announceSocket = new PublisherSocket();
         _announceSocket.Connect(_proxyPubEndpoint);
         _referenceSocket = new RequestSocket();
         _referenceSocket.Connect(_referenceEndpoint);
-        Console.WriteLine($"[SERVIDOR] Conectado à referência em {_referenceEndpoint}");
+        LogVerbose($"[SERVIDOR] Conectado à referência em {_referenceEndpoint}");
         _subSocket = new SubscriberSocket();
         _subSocket.Connect(_proxySubEndpoint);
         _subSocket.Subscribe(TopicoCoordenador);
-        Console.WriteLine($"[SERVIDOR] Conectado ao proxy sub em {_proxySubEndpoint}");
+        LogVerbose($"[SERVIDOR] Conectado ao proxy sub em {_proxySubEndpoint}");
 
         RegistrarNaReferencia();
         var servidores = ListarServidoresReferencia();
         DefinirCoordenadorTentativo(servidores);
         IniciarServicosInternos();
-        Thread.Sleep(StartupDelayMs);
-        ExecutarEleicao("startup");
         Console.WriteLine($"[SERVIDOR] Servidor pronto. Rank local={_meuRank} coordenador={CoordenadorAtual()}");
     }
 
@@ -91,12 +102,16 @@ public class ServidorApp
 
     private Envelope EnviarParaReferencia(Envelope env)
     {
-        Console.WriteLine($"[SERVIDOR] Enviando {env.ConteudoCase} para referência {Mensageria.CabecalhoTexto(env.Cabecalho)}");
-        _referenceSocket.SendFrame(env.ToByteArray());
-        var data = _referenceSocket.ReceiveFrameBytes();
+        LogVerbose($"[SERVIDOR] Enviando {env.ConteudoCase} para referência {Mensageria.CabecalhoTexto(env.Cabecalho)}");
+        byte[] data;
+        lock (_referenceLock)
+        {
+            _referenceSocket.SendFrame(env.ToByteArray());
+            data = _referenceSocket.ReceiveFrameBytes();
+        }
         var resp = Mensageria.EnvelopeFromBytes(data);
         _relogio.OnReceive(resp.Cabecalho.RelogioLogico);
-        Console.WriteLine($"[SERVIDOR] Recebido {resp.ConteudoCase} da referência {Mensageria.CabecalhoTexto(resp.Cabecalho)}");
+        LogVerbose($"[SERVIDOR] Recebido {resp.ConteudoCase} da referência {Mensageria.CabecalhoTexto(resp.Cabecalho)}");
         return resp;
     }
 
@@ -126,7 +141,7 @@ public class ServidorApp
 
         _meuRank = resp.RegisterServerRes.Rank;
         AtualizarServidoresAtivos([new ServerInfo { Nome = _serverName, Rank = _meuRank }]);
-        Console.WriteLine($"[SERVIDOR] Servidor {_serverName} registrado na referência com rank={resp.RegisterServerRes.Rank}");
+        LogVerbose($"[SERVIDOR] Servidor {_serverName} registrado na referência com rank={resp.RegisterServerRes.Rank}");
     }
 
     private List<ServerInfo> ListarServidoresReferencia()
@@ -153,7 +168,7 @@ public class ServidorApp
         var resumo = servidores.Count == 0
             ? "(nenhum)"
             : string.Join(", ", servidores.Select(item => $"{item.Nome}(rank={item.Rank})"));
-        Console.WriteLine($"[SERVIDOR] Servidores disponíveis na referência: {resumo}");
+        LogVerbose($"[SERVIDOR] Servidores disponíveis na referência: {resumo}");
         return servidores;
     }
 
@@ -183,8 +198,9 @@ public class ServidorApp
             return;
         }
 
-        Console.WriteLine($"[SERVIDOR] Heartbeat enviado com sucesso para {_serverName}");
+        LogVerbose($"[SERVIDOR] Heartbeat enviado com sucesso para {_serverName}");
         var servidores = ListarServidoresReferencia();
+        AtualizarCoordenadorTentativo();
         var coordenador = CoordenadorAtual();
         var encontrado = servidores.Any(servidor => servidor.Nome == coordenador);
         if (!string.IsNullOrWhiteSpace(coordenador) && !encontrado)
@@ -219,13 +235,30 @@ public class ServidorApp
         _ = Task.Run(LoopRelogio);
         _ = Task.Run(LoopEleicao);
         _ = Task.Run(LoopAnunciosCoordenador);
+        _ = Task.Run(LoopManutencaoReferencia);
+    }
+
+    private void LoopManutencaoReferencia()
+    {
+        while (true)
+        {
+            try
+            {
+                Thread.Sleep(MaintenanceInterval);
+                HeartbeatESincronizar();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SERVIDOR] Erro na manutenção periódica da referência: {ex.Message}");
+            }
+        }
     }
 
     private void LoopRelogio()
     {
         using var sock = new ResponseSocket();
         sock.Bind($"tcp://*:{ClockPort}");
-        Console.WriteLine($"[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:{ClockPort}");
+        LogVerbose($"[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:{ClockPort}");
 
         while (true)
         {
@@ -263,7 +296,7 @@ public class ServidorApp
     {
         using var sock = new ResponseSocket();
         sock.Bind($"tcp://*:{ElectionPort}");
-        Console.WriteLine($"[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:{ElectionPort}");
+        LogVerbose($"[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:{ElectionPort}");
 
         while (true)
         {
@@ -299,7 +332,7 @@ public class ServidorApp
 
     private void LoopAnunciosCoordenador()
     {
-        Console.WriteLine($"[SERVIDOR] Escutando anúncios de coordenador no tópico {TopicoCoordenador}");
+        LogVerbose($"[SERVIDOR] Escutando anúncios de coordenador no tópico {TopicoCoordenador}");
 
         while (true)
         {
@@ -316,7 +349,18 @@ public class ServidorApp
                     continue;
                 }
 
-                SetCoordenador(coordenador, $"anúncio publicado por {channelMsg.Remetente}", true);
+                var remetente = channelMsg.Remetente?.Trim() ?? "";
+                if (remetente == _serverName && coordenador == _serverName)
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(remetente))
+                {
+                    remetente = "desconhecido";
+                }
+
+                SetCoordenador(coordenador, $"anúncio publicado por {remetente}", true);
                 Console.WriteLine($"[SERVIDOR] Anúncio de coordenador recebido em {topic}: {coordenador}");
             }
             catch (Exception ex)
@@ -372,7 +416,7 @@ public class ServidorApp
             }
         }
 
-        Console.WriteLine($"[SERVIDOR] Lista ativa local atualizada: {ResumoServidores(ServidoresAtivosSnapshot())}");
+        LogVerbose($"[SERVIDOR] Lista ativa local atualizada: {ResumoServidores(ServidoresAtivosSnapshot())}");
     }
 
     private string MaiorServidorAtivo()
@@ -434,6 +478,26 @@ public class ServidorApp
         SetCoordenador(candidato, "coordenador tentativo inicial", false);
     }
 
+    private void AtualizarCoordenadorTentativo()
+    {
+        string atual;
+        lock (_stateLock)
+        {
+            if (_electionRunning || _coordenadorVersao > 0)
+            {
+                return;
+            }
+
+            atual = _coordenadorAtual;
+        }
+
+        var candidato = MaiorServidorAtivo();
+        if (!string.IsNullOrWhiteSpace(candidato) && candidato != atual)
+        {
+            SetCoordenador(candidato, "coordenador tentativo atualizado pela lista ativa", false);
+        }
+    }
+
     private bool IsCoordenador() => CoordenadorAtual() == _serverName;
 
     private void IniciarEleicaoAsync(string motivo)
@@ -447,7 +511,7 @@ public class ServidorApp
         {
             if (_electionRunning)
             {
-                Console.WriteLine($"[SERVIDOR] Eleição já em andamento; ignorando gatilho ({motivo})");
+                LogVerbose($"[SERVIDOR] Eleição já em andamento; ignorando gatilho ({motivo})");
                 return;
             }
 
@@ -603,7 +667,7 @@ public class ServidorApp
             HeartbeatReq = req
         };
 
-        Console.WriteLine($"[SERVIDOR] Enviando heartbeat_req para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
+        LogVerbose($"[SERVIDOR] Enviando heartbeat_req para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
         var reply = EnviarParaServidor(nomeServidor, ClockPort, env, RequestTimeoutMs);
         if (reply is null)
         {
@@ -624,7 +688,7 @@ public class ServidorApp
             return null;
         }
 
-        Console.WriteLine($"[SERVIDOR] Recebido heartbeat_res de {nomeServidor} {Mensageria.CabecalhoTexto(reply.Envelope.Cabecalho)}");
+        LogVerbose($"[SERVIDOR] Recebido heartbeat_res de {nomeServidor} {Mensageria.CabecalhoTexto(reply.Envelope.Cabecalho)}");
         return reply;
     }
 
@@ -642,7 +706,7 @@ public class ServidorApp
             RegisterServerReq = req
         };
 
-        Console.WriteLine($"[SERVIDOR] Enviando pedido de eleição para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
+        LogVerbose($"[SERVIDOR] Enviando pedido de eleição para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
         var reply = EnviarParaServidor(nomeServidor, ElectionPort, env, RequestTimeoutMs);
         if (reply is null)
         {
@@ -687,7 +751,7 @@ public class ServidorApp
         }
 
         _relogio.AtualizarOffset(reply.Envelope.Cabecalho.TimestampEnvio, reply.EnvioNs, reply.RecebimentoNs);
-        Console.WriteLine($"[SERVIDOR] Offset físico atualizado para {_relogio.OffsetMillis()} ms usando coordenador {coordenador}");
+        LogVerbose($"[SERVIDOR] Offset físico atualizado para {_relogio.OffsetMillis()} ms usando coordenador {coordenador}");
         return true;
     }
 
@@ -729,7 +793,7 @@ public class ServidorApp
         var mediaNs = amostras.Sum() / amostras.Count;
         var agoraNs = Mensageria.AgoraNs();
         _relogio.AtualizarOffset(Mensageria.TimestampFromNs(mediaNs), agoraNs, agoraNs);
-        Console.WriteLine(
+        LogVerbose(
             $"[SERVIDOR] Berkeley aplicado pelo coordenador {_serverName} com participantes={string.Join(", ", participantes)} falhas={string.Join(", ", falhas)} media={Mensageria.TimestampTexto(Mensageria.TimestampFromNs(mediaNs))} offset={_relogio.OffsetMillis()} ms"
         );
     }
@@ -796,20 +860,20 @@ public class ServidorApp
         if (IsCoordenador())
         {
             resposta.Status = Status.Sucesso;
-            Console.WriteLine($"[SERVIDOR] Respondendo relógio ao servidor {solicitante} como coordenador");
+            LogVerbose($"[SERVIDOR] Respondendo relógio ao servidor {solicitante} como coordenador");
             return resposta;
         }
 
         if (!string.IsNullOrWhiteSpace(coordenador) && solicitante == coordenador)
         {
             resposta.Status = Status.Sucesso;
-            Console.WriteLine($"[SERVIDOR] Respondendo relógio ao coordenador {solicitante}");
+            LogVerbose($"[SERVIDOR] Respondendo relógio ao coordenador {solicitante}");
             return resposta;
         }
 
         resposta.Status = Status.Erro;
         resposta.ErroMsg = "nao sou coordenador";
-        Console.WriteLine($"[SERVIDOR] Pedido de relógio de {solicitante} rejeitado; coordenador atual={coordenador}");
+        LogVerbose($"[SERVIDOR] Pedido de relógio de {solicitante} rejeitado; coordenador atual={coordenador}");
         return resposta;
     }
 
@@ -854,14 +918,14 @@ public class ServidorApp
 
     public void Loop()
     {
-        Console.WriteLine("[SERVIDOR] Aguardando mensagens...");
+        LogVerbose("[SERVIDOR] Aguardando mensagens...");
         while (true)
         {
             var data = _socket.ReceiveFrameBytes();
             var env = Mensageria.EnvelopeFromBytes(data);
             _relogio.OnReceive(env.Cabecalho.RelogioLogico);
             
-            Console.WriteLine($"[SERVIDOR] Recebido {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
+            LogVerbose($"[SERVIDOR] Recebido {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
 
             object? resposta = env.ConteudoCase switch
             {
@@ -898,7 +962,7 @@ public class ServidorApp
                 respEnv.PublishRes = pr;
             }
 
-            Console.WriteLine($"[SERVIDOR] Enviando {respEnv.ConteudoCase} {Mensageria.CabecalhoTexto(respEnv.Cabecalho)}");
+            LogVerbose($"[SERVIDOR] Enviando {respEnv.ConteudoCase} {Mensageria.CabecalhoTexto(respEnv.Cabecalho)}");
             _socket.SendFrame(respEnv.ToByteArray());
 
             _requestsProcessadas += 1;
@@ -1002,7 +1066,7 @@ public class ServidorApp
             RelogioLogico = cabPub.RelogioLogico
         };
 
-        Console.WriteLine($"[SERVIDOR] Publicando em {canal} ts={Mensageria.TimestampTexto(channelMsg.TimestampEnvio)} relogio={channelMsg.RelogioLogico}");
+        LogVerbose($"[SERVIDOR] Publicando em {canal} ts={Mensageria.TimestampTexto(channelMsg.TimestampEnvio)} relogio={channelMsg.RelogioLogico}");
         _pubSocket.SendMoreFrame(canal).SendFrame(channelMsg.ToByteArray());
 
         RegistrarPublicacao(canal, mensagem, remetente, Mensageria.TimestampTexto(channelMsg.TimestampEnvio));
