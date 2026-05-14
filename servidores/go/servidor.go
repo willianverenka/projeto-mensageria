@@ -27,10 +27,13 @@ const (
 	dataDirDefault      = "/data"
 	clockPort           = 5560
 	electionPort        = 5561
+	snapshotPort        = 5562
 	requestTimeout      = 2 * time.Second
+	snapshotTimeout     = 10 * time.Second
 	announcementDelay   = 3 * time.Second
 	maintenanceInterval = 5 * time.Second
 	topicoCoordenador   = "servers"
+	topicoReplica       = "__replica__"
 )
 
 var logMode = strings.ToLower(strings.TrimSpace(getEnv("SERVER_LOG_MODE", "presentation")))
@@ -70,7 +73,7 @@ func main() {
 		pubSock:           mustNewPubSocket(pubEndpoint),
 		announceSock:      mustNewPubSocket(pubEndpoint),
 		refSock:           mustNewReqSocket(refEndpoint),
-		subSock:           mustNewSubSocket(proxySubEndpoint, topicoCoordenador),
+		subSock:           mustNewSubSocket(proxySubEndpoint, topicoCoordenador, topicoReplica),
 		dataDir:           dataDir,
 		pubEndpoint:       pubEndpoint,
 		referenceEndpoint: refEndpoint,
@@ -92,6 +95,7 @@ func main() {
 	server.atualizarServidoresAtivos(servidores)
 	server.definirCoordenadorTentativo(servidores)
 	server.iniciarServicosInternos()
+	server.sincronizarReplicas()
 	log.Printf("[SERVIDOR] Servidor pronto. Rank local=%d coordenador=%s", server.myRank, server.coordenadorAtual())
 	server.loop()
 }
@@ -110,6 +114,7 @@ type Servidor struct {
 	announceSock      *zmq4.Socket
 	subSock           *zmq4.Socket
 	stateMu           sync.RWMutex
+	storageMu         sync.Mutex
 	refMu             sync.Mutex
 	coordenador       string
 	coordenadorVersao int64
@@ -163,7 +168,7 @@ func mustNewReqSocketWithTimeout(endpoint string, timeout time.Duration) *zmq4.S
 	return sock
 }
 
-func mustNewSubSocket(endpoint, topic string) *zmq4.Socket {
+func mustNewSubSocket(endpoint string, topics ...string) *zmq4.Socket {
 	sock, err := zmq4.NewSocket(zmq4.SUB)
 	if err != nil {
 		log.Fatalf("Novo socket SUB: %v", err)
@@ -171,8 +176,10 @@ func mustNewSubSocket(endpoint, topic string) *zmq4.Socket {
 	if err := sock.Connect(endpoint); err != nil {
 		log.Fatalf("Conectar SUB ao proxy: %v", err)
 	}
-	if err := sock.SetSubscribe(topic); err != nil {
-		log.Fatalf("Inscrever no tópico %s: %v", topic, err)
+	for _, topic := range topics {
+		if err := sock.SetSubscribe(topic); err != nil {
+			log.Fatalf("Inscrever no tópico %s: %v", topic, err)
+		}
 	}
 	return sock
 }
@@ -327,6 +334,7 @@ func (s *Servidor) heartbeatESincronizar() {
 			s.iniciarEleicaoAsync("coordenador ausente da lista ativa")
 		}
 	}
+	s.sincronizarReplicas()
 }
 
 func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bool) (*protos.Envelope, error) {
@@ -358,6 +366,12 @@ func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bo
 }
 
 func (s *Servidor) lerCanais() []string {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	return s.lerCanaisSemLock()
+}
+
+func (s *Servidor) lerCanaisSemLock() []string {
 	data, err := os.ReadFile(s.canaisPath())
 	if err != nil {
 		return nil
@@ -366,39 +380,407 @@ func (s *Servidor) lerCanais() []string {
 	if err := json.Unmarshal(data, &canais); err != nil {
 		return nil
 	}
+	canais = normalizarCanais(canais)
 	return canais
 }
 
 func (s *Servidor) salvarCanais(canais []string) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	s.salvarCanaisSemLock(canais)
+}
+
+func (s *Servidor) salvarCanaisSemLock(canais []string) {
+	canais = normalizarCanais(canais)
 	data, _ := json.Marshal(canais)
 	_ = os.WriteFile(s.canaisPath(), data, 0644)
 }
 
-func (s *Servidor) registrarLogin(nomeUsuario, timestampISO string) {
-	line, _ := json.Marshal(map[string]string{"usuario": nomeUsuario, "timestamp": timestampISO})
-	f, err := os.OpenFile(s.loginsPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
+func normalizarCanais(canais []string) []string {
+	seen := map[string]bool{}
+	normalizados := make([]string, 0, len(canais))
+	for _, canal := range canais {
+		canal = strings.TrimSpace(canal)
+		if canal == "" || seen[canal] {
+			continue
+		}
+		seen[canal] = true
+		normalizados = append(normalizados, canal)
 	}
-	defer f.Close()
-	_, _ = f.Write(append(line, '\n'))
+	sort.Strings(normalizados)
+	return normalizados
+}
+
+func (s *Servidor) adicionarCanalIdempotente(nome string) bool {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	canais := s.lerCanaisSemLock()
+	for _, canal := range canais {
+		if canal == nome {
+			return false
+		}
+	}
+	canais = append(canais, nome)
+	s.salvarCanaisSemLock(canais)
+	return true
+}
+
+func (s *Servidor) lerJSONL(path string) []map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(data), "\n")
+	registros := make([]map[string]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item map[string]string
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			continue
+		}
+		registros = append(registros, item)
+	}
+	return registros
+}
+
+func (s *Servidor) salvarJSONL(path string, registros []map[string]string) {
+	var builder strings.Builder
+	for _, registro := range registros {
+		line, err := json.Marshal(registro)
+		if err != nil {
+			continue
+		}
+		builder.Write(line)
+		builder.WriteByte('\n')
+	}
+	_ = os.WriteFile(path, []byte(builder.String()), 0644)
+}
+
+func (s *Servidor) registrarLogin(nomeUsuario, timestampISO string) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	registros := s.lerJSONL(s.loginsPath())
+	for _, item := range registros {
+		if item["usuario"] == nomeUsuario && item["timestamp"] == timestampISO {
+			return
+		}
+	}
+	registros = append(registros, map[string]string{"usuario": nomeUsuario, "timestamp": timestampISO})
+	sort.Slice(registros, func(i, j int) bool {
+		if registros[i]["timestamp"] == registros[j]["timestamp"] {
+			return registros[i]["usuario"] < registros[j]["usuario"]
+		}
+		return registros[i]["timestamp"] < registros[j]["timestamp"]
+	})
+	s.salvarJSONL(s.loginsPath(), registros)
 }
 
 func (s *Servidor) registrarPublicacao(canal, mensagem, remetente, timestampISO string) {
-	line, _ := json.Marshal(
-		map[string]string{
-			"canal":     canal,
-			"mensagem":  mensagem,
-			"remetente": remetente,
-			"timestamp": timestampISO,
-		},
-	)
-	f, err := os.OpenFile(s.publicacoesPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	registros := s.lerJSONL(s.publicacoesPath())
+	for _, item := range registros {
+		if item["canal"] == canal &&
+			item["mensagem"] == mensagem &&
+			item["remetente"] == remetente &&
+			item["timestamp"] == timestampISO {
+			return
+		}
+	}
+	registros = append(registros, map[string]string{
+		"canal":     canal,
+		"mensagem":  mensagem,
+		"remetente": remetente,
+		"timestamp": timestampISO,
+	})
+	sort.Slice(registros, func(i, j int) bool {
+		left := registros[i]
+		right := registros[j]
+		if left["timestamp"] != right["timestamp"] {
+			return left["timestamp"] < right["timestamp"]
+		}
+		if left["canal"] != right["canal"] {
+			return left["canal"] < right["canal"]
+		}
+		if left["remetente"] != right["remetente"] {
+			return left["remetente"] < right["remetente"]
+		}
+		return left["mensagem"] < right["mensagem"]
+	})
+	s.salvarJSONL(s.publicacoesPath(), registros)
+}
+
+func (s *Servidor) replicaOrigem() string {
+	return "replica:" + s.serverName
+}
+
+func timestampTextoParaTimestamp(texto string) *timestamppb.Timestamp {
+	partes := strings.SplitN(texto, ".", 2)
+	if len(partes) != 2 {
+		return timestamppb.New(time.Unix(0, 0).UTC())
+	}
+	var segundos int64
+	var nanos int64
+	_, _ = fmt.Sscanf(partes[0], "%d", &segundos)
+	nanosTexto := partes[1]
+	if len(nanosTexto) > 9 {
+		nanosTexto = nanosTexto[:9]
+	}
+	for len(nanosTexto) < 9 {
+		nanosTexto += "0"
+	}
+	_, _ = fmt.Sscanf(nanosTexto, "%d", &nanos)
+	return timestamppb.New(time.Unix(segundos, nanos).UTC())
+}
+
+func (s *Servidor) novoEnvelopeReplicacao() *protos.Envelope {
+	return &protos.Envelope{Cabecalho: mensageria.NovoCabecalho(s.replicaOrigem(), s.clock)}
+}
+
+func (s *Servidor) publicarReplicacao(env *protos.Envelope) {
+	data, err := proto.Marshal(env)
 	if err != nil {
+		log.Printf("[SERVIDOR] Falha ao serializar réplica: %v", err)
 		return
 	}
-	defer f.Close()
-	_, _ = f.Write(append(line, '\n'))
+	if _, err := s.pubSock.SendMessage([]byte(topicoReplica), data); err != nil {
+		log.Printf("[SERVIDOR] Falha ao publicar réplica: %v", err)
+	}
+}
+
+func (s *Servidor) replicarLogin(req *protos.LoginRequest) {
+	env := s.novoEnvelopeReplicacao()
+	env.Conteudo = &protos.Envelope_LoginReq{LoginReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) replicarCreateChannel(req *protos.CreateChannelRequest) {
+	env := s.novoEnvelopeReplicacao()
+	env.Conteudo = &protos.Envelope_CreateChannelReq{CreateChannelReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) replicarPublicacao(canal, mensagem, remetente string, cabPublicacao *protos.Cabecalho) {
+	env := s.novoEnvelopeReplicacao()
+	cab := proto.Clone(cabPublicacao).(*protos.Cabecalho)
+	cab.LinguagemOrigem = remetente
+	req := &protos.PublishRequest{
+		Cabecalho: cab,
+		Canal:     canal,
+		Mensagem:  mensagem,
+	}
+	env.Conteudo = &protos.Envelope_PublishReq{PublishReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) operacoesSnapshot() []*protos.Envelope {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	operacoes := []*protos.Envelope{}
+	for _, item := range s.lerJSONL(s.loginsPath()) {
+		nome := strings.TrimSpace(item["usuario"])
+		if nome == "" {
+			continue
+		}
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: "snapshot",
+			TimestampEnvio:  timestampTextoParaTimestamp(item["timestamp"]),
+		}
+		env.Conteudo = &protos.Envelope_LoginReq{
+			LoginReq: &protos.LoginRequest{Cabecalho: cab, NomeUsuario: nome},
+		}
+		operacoes = append(operacoes, env)
+	}
+
+	for _, canal := range s.lerCanaisSemLock() {
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: "snapshot",
+			TimestampEnvio:  timestamppb.New(time.Unix(0, 0).UTC()),
+		}
+		env.Conteudo = &protos.Envelope_CreateChannelReq{
+			CreateChannelReq: &protos.CreateChannelRequest{Cabecalho: cab, NomeCanal: canal},
+		}
+		operacoes = append(operacoes, env)
+	}
+
+	for _, item := range s.lerJSONL(s.publicacoesPath()) {
+		canal := strings.TrimSpace(item["canal"])
+		mensagem := strings.TrimSpace(item["mensagem"])
+		if canal == "" || mensagem == "" {
+			continue
+		}
+		remetente := strings.TrimSpace(item["remetente"])
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: remetente,
+			TimestampEnvio:  timestampTextoParaTimestamp(item["timestamp"]),
+		}
+		env.Conteudo = &protos.Envelope_PublishReq{
+			PublishReq: &protos.PublishRequest{Cabecalho: cab, Canal: canal, Mensagem: mensagem},
+		}
+		operacoes = append(operacoes, env)
+	}
+	return operacoes
+}
+
+func (s *Servidor) aplicarOperacaoReplicada(env *protos.Envelope) {
+	switch c := env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		nome := strings.TrimSpace(c.LoginReq.GetNomeUsuario())
+		if nome != "" {
+			s.registrarLogin(nome, mensageria.TimestampTexto(c.LoginReq.GetCabecalho().GetTimestampEnvio()))
+		}
+	case *protos.Envelope_CreateChannelReq:
+		nome := strings.TrimSpace(c.CreateChannelReq.GetNomeCanal())
+		if nome != "" {
+			s.adicionarCanalIdempotente(nome)
+		}
+	case *protos.Envelope_PublishReq:
+		req := c.PublishReq
+		canal := strings.TrimSpace(req.GetCanal())
+		mensagem := strings.TrimSpace(req.GetMensagem())
+		if canal == "" || mensagem == "" {
+			return
+		}
+		s.adicionarCanalIdempotente(canal)
+		remetente := strings.TrimSpace(req.GetCabecalho().GetLinguagemOrigem())
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		s.registrarPublicacao(
+			canal,
+			mensagem,
+			remetente,
+			mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()),
+		)
+	}
+}
+
+func chaveLogin(item map[string]string) string {
+	return item["usuario"] + "\x00" + item["timestamp"]
+}
+
+func chavePublicacao(item map[string]string) string {
+	return item["canal"] + "\x00" + item["mensagem"] + "\x00" + item["remetente"] + "\x00" + item["timestamp"]
+}
+
+func (s *Servidor) aplicarOperacoesReplicadas(operacoes []*protos.Envelope) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	canaisSet := map[string]bool{}
+	for _, canal := range s.lerCanaisSemLock() {
+		canaisSet[canal] = true
+	}
+
+	loginsPorChave := map[string]map[string]string{}
+	for _, item := range s.lerJSONL(s.loginsPath()) {
+		loginsPorChave[chaveLogin(item)] = item
+	}
+
+	publicacoesPorChave := map[string]map[string]string{}
+	for _, item := range s.lerJSONL(s.publicacoesPath()) {
+		publicacoesPorChave[chavePublicacao(item)] = item
+	}
+
+	for _, env := range operacoes {
+		switch c := env.GetConteudo().(type) {
+		case *protos.Envelope_LoginReq:
+			nome := strings.TrimSpace(c.LoginReq.GetNomeUsuario())
+			if nome == "" {
+				continue
+			}
+			item := map[string]string{
+				"usuario":   nome,
+				"timestamp": mensageria.TimestampTexto(c.LoginReq.GetCabecalho().GetTimestampEnvio()),
+			}
+			loginsPorChave[chaveLogin(item)] = item
+		case *protos.Envelope_CreateChannelReq:
+			nome := strings.TrimSpace(c.CreateChannelReq.GetNomeCanal())
+			if nome != "" {
+				canaisSet[nome] = true
+			}
+		case *protos.Envelope_PublishReq:
+			req := c.PublishReq
+			canal := strings.TrimSpace(req.GetCanal())
+			mensagem := strings.TrimSpace(req.GetMensagem())
+			if canal == "" || mensagem == "" {
+				continue
+			}
+			canaisSet[canal] = true
+			remetente := strings.TrimSpace(req.GetCabecalho().GetLinguagemOrigem())
+			if remetente == "" {
+				remetente = "desconhecido"
+			}
+			item := map[string]string{
+				"canal":     canal,
+				"mensagem":  mensagem,
+				"remetente": remetente,
+				"timestamp": mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()),
+			}
+			publicacoesPorChave[chavePublicacao(item)] = item
+		}
+	}
+
+	canais := make([]string, 0, len(canaisSet))
+	for canal := range canaisSet {
+		canais = append(canais, canal)
+	}
+	s.salvarCanaisSemLock(canais)
+
+	logins := make([]map[string]string, 0, len(loginsPorChave))
+	for _, item := range loginsPorChave {
+		logins = append(logins, item)
+	}
+	sort.Slice(logins, func(i, j int) bool {
+		if logins[i]["timestamp"] == logins[j]["timestamp"] {
+			return logins[i]["usuario"] < logins[j]["usuario"]
+		}
+		return logins[i]["timestamp"] < logins[j]["timestamp"]
+	})
+	s.salvarJSONL(s.loginsPath(), logins)
+
+	publicacoes := make([]map[string]string, 0, len(publicacoesPorChave))
+	for _, item := range publicacoesPorChave {
+		publicacoes = append(publicacoes, item)
+	}
+	sort.Slice(publicacoes, func(i, j int) bool {
+		left := publicacoes[i]
+		right := publicacoes[j]
+		if left["timestamp"] != right["timestamp"] {
+			return left["timestamp"] < right["timestamp"]
+		}
+		if left["canal"] != right["canal"] {
+			return left["canal"] < right["canal"]
+		}
+		if left["remetente"] != right["remetente"] {
+			return left["remetente"] < right["remetente"]
+		}
+		return left["mensagem"] < right["mensagem"]
+	})
+	s.salvarJSONL(s.publicacoesPath(), publicacoes)
+}
+
+func (s *Servidor) respostaSnapshotStatus(status protos.Status, erroMsg string) *protos.Envelope {
+	cab := mensageria.NovoCabecalho(s.origem, s.clock)
+	res := &protos.HeartbeatResponse{
+		Cabecalho: cab,
+		Status:    status,
+		ErroMsg:   erroMsg,
+	}
+	return &protos.Envelope{
+		Cabecalho: cab,
+		Conteudo:  &protos.Envelope_HeartbeatRes{HeartbeatRes: res},
+	}
 }
 
 func (s *Servidor) loop() {
@@ -474,6 +856,7 @@ func (s *Servidor) loop() {
 func (s *Servidor) iniciarServicosInternos() {
 	go s.loopRelogio()
 	go s.loopEleicao()
+	go s.loopSnapshot()
 	go s.loopAnunciosCoordenador()
 	go s.loopManutencaoReferencia()
 }
@@ -484,6 +867,128 @@ func (s *Servidor) loopManutencaoReferencia() {
 	for range ticker.C {
 		s.heartbeatESincronizar()
 	}
+}
+
+func (s *Servidor) loopSnapshot() {
+	sock := mustBindReplySocket(snapshotPort)
+	defer sock.Close()
+	logVerbose("[SERVIDOR] Serviço de snapshot ouvindo em tcp://*:%d", snapshotPort)
+	for {
+		data, err := sock.RecvBytes(0)
+		if err != nil {
+			log.Printf("[SERVIDOR] Erro no serviço de snapshot: %v", err)
+			continue
+		}
+
+		env, err := mensageria.EnvelopeFromBytes(data)
+		if err != nil {
+			log.Printf("[SERVIDOR] Snapshot request inválido: %v", err)
+			continue
+		}
+		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+
+		status := s.respostaSnapshotStatus(protos.Status_STATUS_SUCESSO, "")
+		if _, ok := env.GetConteudo().(*protos.Envelope_HeartbeatReq); !ok {
+			status = s.respostaSnapshotStatus(protos.Status_STATUS_ERRO, "tipo não suportado para snapshot")
+		}
+
+		frames := [][]byte{}
+		statusData, _ := proto.Marshal(status)
+		frames = append(frames, statusData)
+		if status.GetHeartbeatRes().GetStatus() == protos.Status_STATUS_SUCESSO {
+			for _, op := range s.operacoesSnapshot() {
+				data, err := proto.Marshal(op)
+				if err == nil {
+					frames = append(frames, data)
+				}
+			}
+		}
+		parts := make([]interface{}, len(frames))
+		for i, frame := range frames {
+			parts[i] = frame
+		}
+		if _, err := sock.SendMessage(parts...); err != nil {
+			log.Printf("[SERVIDOR] Erro ao enviar snapshot: %v", err)
+		}
+	}
+}
+
+func (s *Servidor) sincronizarReplicas() {
+	candidatos := []string{}
+	coordenador := s.coordenadorAtual()
+	if coordenador != "" && coordenador != s.serverName {
+		candidatos = append(candidatos, coordenador)
+	}
+	for _, servidor := range s.servidoresAtivosSnapshot() {
+		nome := servidor.GetNome()
+		if nome == s.serverName || contemString(candidatos, nome) {
+			continue
+		}
+		candidatos = append(candidatos, nome)
+	}
+	for _, nome := range candidatos {
+		s.solicitarSnapshot(nome)
+	}
+}
+
+func contemString(items []string, procurado string) bool {
+	for _, item := range items {
+		if item == procurado {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Servidor) solicitarSnapshot(nomeServidor string) bool {
+	cab := mensageria.NovoCabecalho(s.origem, s.clock)
+	req := &protos.HeartbeatRequest{Cabecalho: cab, NomeServidor: s.serverName}
+	env := &protos.Envelope{
+		Cabecalho: cab,
+		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
+	}
+	data, err := proto.Marshal(env)
+	if err != nil {
+		return false
+	}
+
+	sock := mustNewReqSocketWithTimeout(fmt.Sprintf("tcp://%s:%d", nomeServidor, snapshotPort), snapshotTimeout)
+	defer sock.Close()
+	if _, err := sock.SendBytes(data, 0); err != nil {
+		return false
+	}
+	frames, err := sock.RecvMessageBytes(0)
+	if err != nil || len(frames) == 0 {
+		return false
+	}
+
+	statusEnv, err := mensageria.EnvelopeFromBytes(frames[0])
+	if err != nil {
+		return false
+	}
+	s.clock.OnReceive(statusEnv.GetCabecalho().GetRelogioLogico())
+	status, ok := statusEnv.GetConteudo().(*protos.Envelope_HeartbeatRes)
+	if !ok || status.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+		return false
+	}
+
+	operacoes := []*protos.Envelope{}
+	for _, frame := range frames[1:] {
+		op, err := mensageria.EnvelopeFromBytes(frame)
+		if err != nil {
+			continue
+		}
+		s.clock.OnReceive(op.GetCabecalho().GetRelogioLogico())
+		operacoes = append(operacoes, op)
+	}
+	if len(operacoes) > 0 {
+		s.aplicarOperacoesReplicadas(operacoes)
+	}
+	aplicadas := len(operacoes)
+	if aplicadas > 0 {
+		logVerbose("[SERVIDOR] Snapshot aplicado de %s com %d operações", nomeServidor, aplicadas)
+	}
+	return true
 }
 
 func mustBindReplySocket(port int) *zmq4.Socket {
@@ -582,11 +1087,28 @@ func (s *Servidor) loopEleicao() {
 }
 
 func (s *Servidor) loopAnunciosCoordenador() {
-	logVerbose("[SERVIDOR] Escutando anúncios de coordenador no tópico %s", topicoCoordenador)
+	logVerbose("[SERVIDOR] Escutando tópicos internos %s e %s", topicoCoordenador, topicoReplica)
 	for {
 		msg, err := s.subSock.RecvMessageBytes(0)
 		if err != nil || len(msg) < 2 {
 			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		topico := string(msg[0])
+		if topico == topicoReplica {
+			env, err := mensageria.EnvelopeFromBytes(msg[1])
+			if err != nil {
+				continue
+			}
+			if env.GetCabecalho().GetLinguagemOrigem() == s.replicaOrigem() {
+				continue
+			}
+			s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+			s.aplicarOperacaoReplicada(env)
+			logVerbose("[SERVIDOR] Operação replicada recebida: %s", conteudoNome(env))
+			continue
+		}
+		if topico != topicoCoordenador {
 			continue
 		}
 
@@ -1090,6 +1612,7 @@ func (s *Servidor) processarLogin(req *protos.LoginRequest) *protos.LoginRespons
 		return res
 	}
 	s.registrarLogin(nome, mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()))
+	s.replicarLogin(req)
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res
 }
@@ -1102,16 +1625,12 @@ func (s *Servidor) processarCreateChannel(req *protos.CreateChannelRequest) *pro
 		res.ErroMsg = "nome de canal vazio"
 		return res
 	}
-	canais := s.lerCanais()
-	for _, c := range canais {
-		if c == nome {
-			res.Status = protos.Status_STATUS_ERRO
-			res.ErroMsg = "canal já existe"
-			return res
-		}
+	if !s.adicionarCanalIdempotente(nome) {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "canal já existe"
+		return res
 	}
-	canais = append(canais, nome)
-	s.salvarCanais(canais)
+	s.replicarCreateChannel(req)
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res
 }
@@ -1185,6 +1704,7 @@ func (s *Servidor) processarPublish(
 	}
 
 	s.registrarPublicacao(canal, mensagem, remetente, mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()))
+	s.replicarPublicacao(canal, mensagem, remetente, cabPub)
 
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res

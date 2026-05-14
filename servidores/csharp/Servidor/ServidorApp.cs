@@ -10,9 +10,12 @@ namespace Servidor;
 public class ServidorApp
 {
     private const string TopicoCoordenador = "servers";
+    private const string TopicoReplica = "__replica__";
     private const int ClockPort = 5560;
     private const int ElectionPort = 5561;
+    private const int SnapshotPort = 5562;
     private const int RequestTimeoutMs = 2000;
+    private const int SnapshotTimeoutMs = 10000;
     private const int AnnouncementTimeoutMs = 3000;
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(5);
     private static readonly string LogMode =
@@ -35,6 +38,7 @@ public class ServidorApp
     private readonly SubscriberSocket _subSocket;
     private readonly object _stateLock = new();
     private readonly object _referenceLock = new();
+    private readonly object _storageLock = new();
     private readonly RelogioProcesso _relogio = new();
     private readonly Dictionary<string, int> _servidoresAtivos = new();
     private string _coordenadorAtual = "";
@@ -84,12 +88,14 @@ public class ServidorApp
         _subSocket = new SubscriberSocket();
         _subSocket.Connect(_proxySubEndpoint);
         _subSocket.Subscribe(TopicoCoordenador);
+        _subSocket.Subscribe(TopicoReplica);
         LogVerbose($"[SERVIDOR] Conectado ao proxy sub em {_proxySubEndpoint}");
 
         RegistrarNaReferencia();
         var servidores = ListarServidoresReferencia();
         DefinirCoordenadorTentativo(servidores);
         IniciarServicosInternos();
+        SincronizarReplicas();
         Console.WriteLine($"[SERVIDOR] Servidor pronto. Rank local={_meuRank} coordenador={CoordenadorAtual()}");
     }
 
@@ -208,32 +214,429 @@ public class ServidorApp
             Console.WriteLine($"[SERVIDOR] Coordenador {coordenador} ausente da lista ativa; iniciando eleição");
             IniciarEleicaoAsync("coordenador ausente da lista ativa");
         }
+        SincronizarReplicas();
     }
 
     private List<string> LerCanais()
     {
-        try { return JsonSerializer.Deserialize<List<string>>(File.ReadAllText(_canaisPath)) ?? []; }
-        catch { return []; }
+        lock (_storageLock)
+        {
+            try
+            {
+                var canais = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(_canaisPath)) ?? [];
+                return NormalizarCanais(canais);
+            }
+            catch
+            {
+                return [];
+            }
+        }
     }
 
-    private void SalvarCanais(List<string> canais) => File.WriteAllText(_canaisPath, JsonSerializer.Serialize(canais));
+    private void SalvarCanais(List<string> canais)
+    {
+        lock (_storageLock)
+        {
+            File.WriteAllText(_canaisPath, JsonSerializer.Serialize(NormalizarCanais(canais)));
+        }
+    }
+
+    private static List<string> NormalizarCanais(IEnumerable<string> canais)
+        => canais
+            .Select(canal => canal.Trim())
+            .Where(canal => !string.IsNullOrWhiteSpace(canal))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(canal => canal, StringComparer.Ordinal)
+            .ToList();
+
+    private bool AdicionarCanalIdempotente(string nome)
+    {
+        lock (_storageLock)
+        {
+            var canais = LerCanais();
+            if (canais.Contains(nome))
+            {
+                return false;
+            }
+
+            canais.Add(nome);
+            SalvarCanais(canais);
+            return true;
+        }
+    }
+
+    private List<Dictionary<string, string>> LerJsonl(string path)
+    {
+        var registros = new List<Dictionary<string, string>>();
+        if (!File.Exists(path))
+        {
+            return registros;
+        }
+
+        foreach (var line in File.ReadAllLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            try
+            {
+                var item = JsonSerializer.Deserialize<Dictionary<string, string>>(line);
+                if (item is not null)
+                {
+                    registros.Add(item);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return registros;
+    }
+
+    private void SalvarJsonl(string path, List<Dictionary<string, string>> registros)
+    {
+        var lines = registros.Select(registro => JsonSerializer.Serialize(registro));
+        File.WriteAllText(path, string.Join(Environment.NewLine, lines) + (registros.Count > 0 ? Environment.NewLine : ""));
+    }
 
     private void RegistrarLogin(string usuario, string ts) 
     {
-        var entry = JsonSerializer.Serialize(new { usuario, timestamp = ts });
-        File.AppendAllText(_loginsPath, entry + Environment.NewLine);
+        lock (_storageLock)
+        {
+            var registros = LerJsonl(_loginsPath);
+            if (registros.Any(item =>
+                    item.GetValueOrDefault("usuario") == usuario &&
+                    item.GetValueOrDefault("timestamp") == ts))
+            {
+                return;
+            }
+
+            registros.Add(new Dictionary<string, string>
+            {
+                ["usuario"] = usuario,
+                ["timestamp"] = ts
+            });
+            registros = registros
+                .OrderBy(item => item.GetValueOrDefault("timestamp"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("usuario"), StringComparer.Ordinal)
+                .ToList();
+            SalvarJsonl(_loginsPath, registros);
+        }
     }
 
     private void RegistrarPublicacao(string canal, string mensagem, string remetente, string ts)
     {
-        var entry = JsonSerializer.Serialize(new { canal, mensagem, remetente, timestamp = ts });
-        File.AppendAllText(_publicacoesPath, entry + Environment.NewLine);
+        lock (_storageLock)
+        {
+            var registros = LerJsonl(_publicacoesPath);
+            if (registros.Any(item =>
+                    item.GetValueOrDefault("canal") == canal &&
+                    item.GetValueOrDefault("mensagem") == mensagem &&
+                    item.GetValueOrDefault("remetente") == remetente &&
+                    item.GetValueOrDefault("timestamp") == ts))
+            {
+                return;
+            }
+
+            registros.Add(new Dictionary<string, string>
+            {
+                ["canal"] = canal,
+                ["mensagem"] = mensagem,
+                ["remetente"] = remetente,
+                ["timestamp"] = ts
+            });
+            registros = registros
+                .OrderBy(item => item.GetValueOrDefault("timestamp"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("canal"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("remetente"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("mensagem"), StringComparer.Ordinal)
+                .ToList();
+            SalvarJsonl(_publicacoesPath, registros);
+        }
+    }
+
+    private string ReplicaOrigem() => $"replica:{_serverName}";
+
+    private static global::Google.Protobuf.WellKnownTypes.Timestamp TimestampTextoParaTimestamp(string texto)
+    {
+        try
+        {
+            var partes = texto.Split('.', 2);
+            var segundos = long.Parse(partes[0]);
+            var nanosTexto = partes.Length > 1 ? partes[1] : "0";
+            if (nanosTexto.Length > 9)
+            {
+                nanosTexto = nanosTexto[..9];
+            }
+            nanosTexto = nanosTexto.PadRight(9, '0');
+            var nanos = int.Parse(nanosTexto);
+            return new global::Google.Protobuf.WellKnownTypes.Timestamp
+            {
+                Seconds = segundos,
+                Nanos = nanos
+            };
+        }
+        catch
+        {
+            return new global::Google.Protobuf.WellKnownTypes.Timestamp { Seconds = 0, Nanos = 0 };
+        }
+    }
+
+    private Envelope NovoEnvelopeReplicacao()
+        => new() { Cabecalho = Mensageria.NovoCabecalho(ReplicaOrigem(), _relogio) };
+
+    private void PublicarReplicacao(Envelope env)
+    {
+        try
+        {
+            _pubSocket.SendMoreFrame(TopicoReplica).SendFrame(env.ToByteArray());
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SERVIDOR] Falha ao publicar réplica: {ex.Message}");
+        }
+    }
+
+    private void ReplicarLogin(LoginRequest req)
+    {
+        var env = NovoEnvelopeReplicacao();
+        env.LoginReq = req.Clone();
+        PublicarReplicacao(env);
+    }
+
+    private void ReplicarCreateChannel(CreateChannelRequest req)
+    {
+        var env = NovoEnvelopeReplicacao();
+        env.CreateChannelReq = req.Clone();
+        PublicarReplicacao(env);
+    }
+
+    private void ReplicarPublicacao(string canal, string mensagem, string remetente, Cabecalho cabPublicacao)
+    {
+        var cab = cabPublicacao.Clone();
+        cab.LinguagemOrigem = remetente;
+        var env = NovoEnvelopeReplicacao();
+        env.PublishReq = new PublishRequest
+        {
+            Cabecalho = cab,
+            Canal = canal,
+            Mensagem = mensagem
+        };
+        PublicarReplicacao(env);
+    }
+
+    private List<Envelope> OperacoesSnapshot()
+    {
+        lock (_storageLock)
+        {
+            var operacoes = new List<Envelope>();
+            foreach (var item in LerJsonl(_loginsPath))
+            {
+                var nome = item.GetValueOrDefault("usuario")?.Trim() ?? "";
+                if (string.IsNullOrWhiteSpace(nome))
+                {
+                    continue;
+                }
+
+                var cab = new Cabecalho
+                {
+                    LinguagemOrigem = "snapshot",
+                    TimestampEnvio = TimestampTextoParaTimestamp(item.GetValueOrDefault("timestamp") ?? "0.000000000")
+                };
+                var env = NovoEnvelopeReplicacao();
+                env.LoginReq = new LoginRequest { Cabecalho = cab, NomeUsuario = nome };
+                operacoes.Add(env);
+            }
+
+            foreach (var canal in LerCanais())
+            {
+                var cab = new Cabecalho
+                {
+                    LinguagemOrigem = "snapshot",
+                    TimestampEnvio = TimestampTextoParaTimestamp("0.000000000")
+                };
+                var env = NovoEnvelopeReplicacao();
+                env.CreateChannelReq = new CreateChannelRequest { Cabecalho = cab, NomeCanal = canal };
+                operacoes.Add(env);
+            }
+
+            foreach (var item in LerJsonl(_publicacoesPath))
+            {
+                var canal = item.GetValueOrDefault("canal")?.Trim() ?? "";
+                var mensagem = item.GetValueOrDefault("mensagem")?.Trim() ?? "";
+                if (string.IsNullOrWhiteSpace(canal) || string.IsNullOrWhiteSpace(mensagem))
+                {
+                    continue;
+                }
+
+                var remetente = item.GetValueOrDefault("remetente")?.Trim() ?? "";
+                if (string.IsNullOrWhiteSpace(remetente))
+                {
+                    remetente = "desconhecido";
+                }
+
+                var cab = new Cabecalho
+                {
+                    LinguagemOrigem = remetente,
+                    TimestampEnvio = TimestampTextoParaTimestamp(item.GetValueOrDefault("timestamp") ?? "0.000000000")
+                };
+                var env = NovoEnvelopeReplicacao();
+                env.PublishReq = new PublishRequest { Cabecalho = cab, Canal = canal, Mensagem = mensagem };
+                operacoes.Add(env);
+            }
+
+            return operacoes;
+        }
+    }
+
+    private void AplicarOperacaoReplicada(Envelope env)
+    {
+        switch (env.ConteudoCase)
+        {
+            case Envelope.ConteudoOneofCase.LoginReq:
+                var usuario = env.LoginReq.NomeUsuario?.Trim() ?? "";
+                if (!string.IsNullOrWhiteSpace(usuario))
+                {
+                    RegistrarLogin(usuario, Mensageria.TimestampTexto(env.LoginReq.Cabecalho.TimestampEnvio));
+                }
+                break;
+            case Envelope.ConteudoOneofCase.CreateChannelReq:
+                var nomeCanal = env.CreateChannelReq.NomeCanal?.Trim() ?? "";
+                if (!string.IsNullOrWhiteSpace(nomeCanal))
+                {
+                    AdicionarCanalIdempotente(nomeCanal);
+                }
+                break;
+            case Envelope.ConteudoOneofCase.PublishReq:
+                var req = env.PublishReq;
+                var canal = req.Canal?.Trim() ?? "";
+                var mensagem = req.Mensagem?.Trim() ?? "";
+                if (string.IsNullOrWhiteSpace(canal) || string.IsNullOrWhiteSpace(mensagem))
+                {
+                    return;
+                }
+                AdicionarCanalIdempotente(canal);
+                var remetente = req.Cabecalho.LinguagemOrigem?.Trim() ?? "";
+                if (string.IsNullOrWhiteSpace(remetente))
+                {
+                    remetente = "desconhecido";
+                }
+                RegistrarPublicacao(canal, mensagem, remetente, Mensageria.TimestampTexto(req.Cabecalho.TimestampEnvio));
+                break;
+        }
+    }
+
+    private static string ChaveLogin(Dictionary<string, string> item)
+        => $"{item.GetValueOrDefault("usuario")}\0{item.GetValueOrDefault("timestamp")}";
+
+    private static string ChavePublicacao(Dictionary<string, string> item)
+        => $"{item.GetValueOrDefault("canal")}\0{item.GetValueOrDefault("mensagem")}\0{item.GetValueOrDefault("remetente")}\0{item.GetValueOrDefault("timestamp")}";
+
+    private void AplicarOperacoesReplicadas(IEnumerable<Envelope> operacoes)
+    {
+        lock (_storageLock)
+        {
+            var canais = LerCanais().ToHashSet(StringComparer.Ordinal);
+
+            var loginsPorChave = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+            foreach (var item in LerJsonl(_loginsPath))
+            {
+                loginsPorChave[ChaveLogin(item)] = item;
+            }
+            var publicacoesPorChave = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+            foreach (var item in LerJsonl(_publicacoesPath))
+            {
+                publicacoesPorChave[ChavePublicacao(item)] = item;
+            }
+
+            foreach (var env in operacoes)
+            {
+                switch (env.ConteudoCase)
+                {
+                    case Envelope.ConteudoOneofCase.LoginReq:
+                        var usuario = env.LoginReq.NomeUsuario?.Trim() ?? "";
+                        if (!string.IsNullOrWhiteSpace(usuario))
+                        {
+                            var item = new Dictionary<string, string>
+                            {
+                                ["usuario"] = usuario,
+                                ["timestamp"] = Mensageria.TimestampTexto(env.LoginReq.Cabecalho.TimestampEnvio)
+                            };
+                            loginsPorChave[ChaveLogin(item)] = item;
+                        }
+                        break;
+                    case Envelope.ConteudoOneofCase.CreateChannelReq:
+                        var nomeCanal = env.CreateChannelReq.NomeCanal?.Trim() ?? "";
+                        if (!string.IsNullOrWhiteSpace(nomeCanal))
+                        {
+                            canais.Add(nomeCanal);
+                        }
+                        break;
+                    case Envelope.ConteudoOneofCase.PublishReq:
+                        var req = env.PublishReq;
+                        var canal = req.Canal?.Trim() ?? "";
+                        var mensagem = req.Mensagem?.Trim() ?? "";
+                        if (string.IsNullOrWhiteSpace(canal) || string.IsNullOrWhiteSpace(mensagem))
+                        {
+                            continue;
+                        }
+                        canais.Add(canal);
+                        var remetente = req.Cabecalho.LinguagemOrigem?.Trim() ?? "";
+                        if (string.IsNullOrWhiteSpace(remetente))
+                        {
+                            remetente = "desconhecido";
+                        }
+                        var publicacao = new Dictionary<string, string>
+                        {
+                            ["canal"] = canal,
+                            ["mensagem"] = mensagem,
+                            ["remetente"] = remetente,
+                            ["timestamp"] = Mensageria.TimestampTexto(req.Cabecalho.TimestampEnvio)
+                        };
+                        publicacoesPorChave[ChavePublicacao(publicacao)] = publicacao;
+                        break;
+                }
+            }
+
+            SalvarCanais(canais.ToList());
+            var logins = loginsPorChave.Values
+                .OrderBy(item => item.GetValueOrDefault("timestamp"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("usuario"), StringComparer.Ordinal)
+                .ToList();
+            var publicacoes = publicacoesPorChave.Values
+                .OrderBy(item => item.GetValueOrDefault("timestamp"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("canal"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("remetente"), StringComparer.Ordinal)
+                .ThenBy(item => item.GetValueOrDefault("mensagem"), StringComparer.Ordinal)
+                .ToList();
+            SalvarJsonl(_loginsPath, logins);
+            SalvarJsonl(_publicacoesPath, publicacoes);
+        }
+    }
+
+    private Envelope RespostaSnapshotStatus(Status status, string erroMsg)
+    {
+        var cab = Mensageria.NovoCabecalho(_origem, _relogio);
+        return new Envelope
+        {
+            Cabecalho = cab,
+            HeartbeatRes = new HeartbeatResponse
+            {
+                Cabecalho = cab.Clone(),
+                Status = status,
+                ErroMsg = erroMsg
+            }
+        };
     }
 
     private void IniciarServicosInternos()
     {
         _ = Task.Run(LoopRelogio);
         _ = Task.Run(LoopEleicao);
+        _ = Task.Run(LoopSnapshot);
         _ = Task.Run(LoopAnunciosCoordenador);
         _ = Task.Run(LoopManutencaoReferencia);
     }
@@ -251,6 +654,127 @@ public class ServidorApp
             {
                 Console.WriteLine($"[SERVIDOR] Erro na manutenção periódica da referência: {ex.Message}");
             }
+        }
+    }
+
+    private void LoopSnapshot()
+    {
+        using var sock = new ResponseSocket();
+        sock.Bind($"tcp://*:{SnapshotPort}");
+        LogVerbose($"[SERVIDOR] Serviço de snapshot ouvindo em tcp://*:{SnapshotPort}");
+
+        while (true)
+        {
+            try
+            {
+                var data = sock.ReceiveFrameBytes();
+                var env = Mensageria.EnvelopeFromBytes(data);
+                _relogio.OnReceive(env.Cabecalho.RelogioLogico);
+
+                var status = env.ConteudoCase == Envelope.ConteudoOneofCase.HeartbeatReq
+                    ? RespostaSnapshotStatus(Status.Sucesso, "")
+                    : RespostaSnapshotStatus(Status.Erro, "tipo nao suportado para snapshot");
+
+                var message = new NetMQMessage();
+                message.Append(status.ToByteArray());
+                if (status.HeartbeatRes.Status == Status.Sucesso)
+                {
+                    foreach (var op in OperacoesSnapshot())
+                    {
+                        message.Append(op.ToByteArray());
+                    }
+                }
+                sock.SendMultipartMessage(message);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SERVIDOR] Erro no serviço de snapshot: {ex.Message}");
+            }
+        }
+    }
+
+    private void SincronizarReplicas()
+    {
+        var candidatos = new List<string>();
+        var coordenador = CoordenadorAtual();
+        if (!string.IsNullOrWhiteSpace(coordenador) && coordenador != _serverName)
+        {
+            candidatos.Add(coordenador);
+        }
+        foreach (var servidor in ServidoresAtivosSnapshot())
+        {
+            if (servidor.Nome != _serverName && !candidatos.Contains(servidor.Nome))
+            {
+                candidatos.Add(servidor.Nome);
+            }
+        }
+
+        foreach (var nome in candidatos)
+        {
+            SolicitarSnapshot(nome);
+        }
+    }
+
+    private bool SolicitarSnapshot(string nomeServidor)
+    {
+        using var sock = new RequestSocket();
+        sock.Options.Linger = TimeSpan.Zero;
+        sock.Connect($"tcp://{nomeServidor}:{SnapshotPort}");
+
+        try
+        {
+            var cab = Mensageria.NovoCabecalho(_origem, _relogio);
+            var env = new Envelope
+            {
+                Cabecalho = cab,
+                HeartbeatReq = new HeartbeatRequest
+                {
+                    Cabecalho = cab.Clone(),
+                    NomeServidor = _serverName
+                }
+            };
+
+            var timeout = TimeSpan.FromMilliseconds(SnapshotTimeoutMs);
+            if (!sock.TrySendFrame(timeout, env.ToByteArray(), false))
+            {
+                return false;
+            }
+
+            var message = new NetMQMessage();
+            if (!sock.TryReceiveMultipartMessage(timeout, ref message) || message.FrameCount == 0)
+            {
+                return false;
+            }
+
+            var statusEnv = Mensageria.EnvelopeFromBytes(message[0].ToByteArray(false));
+            _relogio.OnReceive(statusEnv.Cabecalho.RelogioLogico);
+            if (statusEnv.ConteudoCase != Envelope.ConteudoOneofCase.HeartbeatRes ||
+                statusEnv.HeartbeatRes.Status != Status.Sucesso)
+            {
+                return false;
+            }
+
+            var operacoes = new List<Envelope>();
+            for (var i = 1; i < message.FrameCount; i++)
+            {
+                var op = Mensageria.EnvelopeFromBytes(message[i].ToByteArray(false));
+                _relogio.OnReceive(op.Cabecalho.RelogioLogico);
+                operacoes.Add(op);
+            }
+            if (operacoes.Count > 0)
+            {
+                AplicarOperacoesReplicadas(operacoes);
+            }
+            var aplicadas = operacoes.Count;
+            if (aplicadas > 0)
+            {
+                LogVerbose($"[SERVIDOR] Snapshot aplicado de {nomeServidor} com {aplicadas} operações");
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -332,7 +856,7 @@ public class ServidorApp
 
     private void LoopAnunciosCoordenador()
     {
-        LogVerbose($"[SERVIDOR] Escutando anúncios de coordenador no tópico {TopicoCoordenador}");
+        LogVerbose($"[SERVIDOR] Escutando tópicos internos {TopicoCoordenador} e {TopicoReplica}");
 
         while (true)
         {
@@ -340,6 +864,23 @@ public class ServidorApp
             {
                 var topic = _subSocket.ReceiveFrameString();
                 var payload = _subSocket.ReceiveFrameBytes();
+                if (topic == TopicoReplica)
+                {
+                    var env = Mensageria.EnvelopeFromBytes(payload);
+                    if (env.Cabecalho.LinguagemOrigem == ReplicaOrigem())
+                    {
+                        continue;
+                    }
+                    _relogio.OnReceive(env.Cabecalho.RelogioLogico);
+                    AplicarOperacaoReplicada(env);
+                    LogVerbose($"[SERVIDOR] Operação replicada recebida: {env.ConteudoCase}");
+                    continue;
+                }
+                if (topic != TopicoCoordenador)
+                {
+                    continue;
+                }
+
                 var channelMsg = ChannelMessage.Parser.ParseFrom(payload);
                 _relogio.OnReceive(channelMsg.RelogioLogico);
 
@@ -990,6 +1531,7 @@ public class ServidorApp
         }
 
         RegistrarLogin(nome, Mensageria.TimestampTexto(req.Cabecalho.TimestampEnvio));
+        ReplicarLogin(req);
         
         res.Status = Status.Sucesso;
         return res;
@@ -1007,16 +1549,14 @@ public class ServidorApp
             return res;
         }
 
-        var canais = LerCanais();
-        if (canais.Contains(nome))
+        if (!AdicionarCanalIdempotente(nome))
         {
             res.Status = Status.Erro;
             res.ErroMsg = "canal já existe";
             return res;
         }
 
-        canais.Add(nome);
-        SalvarCanais(canais);
+        ReplicarCreateChannel(req);
         res.Status = Status.Sucesso;
         return res;
     }
@@ -1070,6 +1610,7 @@ public class ServidorApp
         _pubSocket.SendMoreFrame(canal).SendFrame(channelMsg.ToByteArray());
 
         RegistrarPublicacao(canal, mensagem, remetente, Mensageria.TimestampTexto(channelMsg.TimestampEnvio));
+        ReplicarPublicacao(canal, mensagem, remetente, cabPub);
 
         res.Status = Status.Sucesso;
         return res;
