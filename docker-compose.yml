@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile.python
     container_name: orquestrador
     command: ["python", "broker.py"]
+    environment:
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     ports:
       - "5555:5555"
       - "5556:5556"
@@ -25,6 +27,8 @@ services:
       dockerfile: Dockerfile.python
     container_name: referencia
     command: ["python", "referencia.py"]
+    environment:
+      - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
     ports:
       - "5559:5559"
 
@@ -59,6 +63,7 @@ services:
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_python
       - CLIENTE_CANAL=canal_cliente_python
+      - CLIENT_LOG_MODE=${CLIENT_LOG_MODE:-presentation}
     depends_on:
       - orquestrador
       - proxy
@@ -95,6 +100,7 @@ services:
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_go
       - CLIENTE_CANAL=canal_go
+      - CLIENT_LOG_MODE=${CLIENT_LOG_MODE:-presentation}
     depends_on:
       - orquestrador
       - proxy
@@ -131,6 +137,7 @@ services:
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_java
       - CLIENTE_CANAL=canal_java
+      - CLIENT_LOG_MODE=${CLIENT_LOG_MODE:-presentation}
     depends_on:
       - orquestrador
       - proxy
@@ -167,6 +174,7 @@ services:
       - PROXY_SUB_ENDPOINT=tcp://proxy:5558
       - CLIENTE_NOME=cliente_csharp
       - CLIENTE_CANAL=canal_csharp
+      - CLIENT_LOG_MODE=${CLIENT_LOG_MODE:-presentation}
     depends_on:
       - orquestrador
       - proxy

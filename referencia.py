@@ -21,6 +21,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [REFERENCIA] %(messa
 
 REFERENCE_BIND = os.getenv("REFERENCE_BIND", "tcp://*:5559")
 HEARTBEAT_TIMEOUT_SECONDS = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "30"))
+LOG_MODE = os.getenv("REFERENCE_LOG_MODE", os.getenv("SERVER_LOG_MODE", "presentation")).strip().lower()
+
+
+def _log_verbose(message: str, *args: object) -> None:
+    if LOG_MODE == "verbose":
+        logging.info(message, *args)
 
 
 @dataclass
@@ -40,7 +46,7 @@ class Referencia:
         self.next_rank = 1
         self.ranks_por_nome: dict[str, int] = {}
         self.ativos: dict[str, RegistroServidor] = {}
-        logging.info("Serviço de referência ouvindo em %s", REFERENCE_BIND)
+        _log_verbose("Serviço de referência ouvindo em %s", REFERENCE_BIND)
 
     def _remover_expirados(self) -> None:
         agora = time.monotonic()
@@ -50,7 +56,7 @@ class Referencia:
             if agora - registro.last_seen_monotonic > HEARTBEAT_TIMEOUT_SECONDS
         ]
         for nome in expirados:
-            logging.info("Removendo servidor expirado da lista ativa: %s", nome)
+            _log_verbose("Removendo servidor expirado da lista ativa: %s", nome)
             del self.ativos[nome]
 
     def _registrar_servidor(self, nome: str) -> int:
@@ -79,7 +85,7 @@ class Referencia:
             self.relogio.on_receive(env.cabecalho.relogio_logico)
             self._remover_expirados()
             tipo = env.WhichOneof("conteudo")
-            logging.info("Recebido %s %s", tipo, cabecalho_texto(env.cabecalho))
+            _log_verbose("Recebido %s %s", tipo, cabecalho_texto(env.cabecalho))
 
             resposta_env = contrato_pb2.Envelope()
             cab = self._resposta_vazia()
@@ -107,7 +113,7 @@ class Referencia:
                 resposta.erro_msg = f"tipo não suportado: {tipo}"
                 resposta_env.heartbeat_res.CopyFrom(resposta)
 
-            logging.info(
+            _log_verbose(
                 "Enviando %s %s",
                 resposta_env.WhichOneof("conteudo") or "desconhecido",
                 cabecalho_texto(resposta_env.cabecalho),
@@ -127,7 +133,7 @@ class Referencia:
         rank = self._registrar_servidor(nome)
         resposta.status = contrato_pb2.STATUS_SUCESSO
         resposta.rank = rank
-        logging.info("Servidor registrado/renovado: %s rank=%s", nome, rank)
+        _log_verbose("Servidor registrado/renovado: %s rank=%s", nome, rank)
         return resposta
 
     def _processar_list(self) -> contrato_pb2.ListServersResponse:

@@ -23,6 +23,14 @@ const (
 	nomeCanalDefault   = "canal_go"
 )
 
+var clientLogMode = strings.ToLower(strings.TrimSpace(getEnv("CLIENT_LOG_MODE", "presentation")))
+
+func logVerbose(format string, args ...interface{}) {
+	if clientLogMode == "verbose" {
+		log.Printf(format, args...)
+	}
+}
+
 func main() {
 	orqEndpoint := getEnv("ORQ_ENDPOINT", orqEndpointDefault)
 	subEndpoint := getEnv("PROXY_SUB_ENDPOINT", proxySubEndpoint)
@@ -38,7 +46,7 @@ func main() {
 	if err := sock.Connect(orqEndpoint); err != nil {
 		log.Fatalf("Conectar ao orquestrador: %v", err)
 	}
-	log.Printf("[CLIENTE] Conectado ao orquestrador em %s", orqEndpoint)
+	logVerbose("[CLIENTE] Conectado ao orquestrador em %s", orqEndpoint)
 
 	subSock, err := zmq4.NewSocket(zmq4.SUB)
 	if err != nil {
@@ -48,7 +56,7 @@ func main() {
 	if err := subSock.Connect(subEndpoint); err != nil {
 		log.Fatalf("Conectar SUB ao proxy: %v", err)
 	}
-	log.Printf("[CLIENTE] Conectado ao proxy sub em %s", subEndpoint)
+	logVerbose("[CLIENTE] Conectado ao proxy sub em %s", subEndpoint)
 
 	cliente := &Cliente{
 		sock:       sock,
@@ -139,7 +147,7 @@ func (c *Cliente) enviarEAguardar(env *protos.Envelope) (*protos.Envelope, error
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[CLIENTE] Enviando %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
+	logVerbose("[CLIENTE] Enviando %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 	if _, err := c.sock.SendBytes(data, 0); err != nil {
 		return nil, err
 	}
@@ -152,7 +160,7 @@ func (c *Cliente) enviarEAguardar(env *protos.Envelope) (*protos.Envelope, error
 		return nil, err
 	}
 	c.clock.OnReceive(respEnv.GetCabecalho().GetRelogioLogico())
-	log.Printf("[CLIENTE] Recebido %T %s", respEnv.GetConteudo(), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
+	logVerbose("[CLIENTE] Recebido %T %s", respEnv.GetConteudo(), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
 	return respEnv, nil
 }
 
@@ -169,21 +177,21 @@ func (c *Cliente) fazerLogin(nomeUsuario string) bool {
 
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
-		log.Printf("[CLIENTE] Erro ao enviar/aguardar login: %v", err)
+		logVerbose("[CLIENTE] Erro ao enviar/aguardar login: %v", err)
 		return false
 	}
 
 	_, ok := respEnv.GetConteudo().(*protos.Envelope_LoginRes)
 	if !ok {
-		log.Printf("[CLIENTE] Resposta inesperada ao login: %T", respEnv.GetConteudo())
+		logVerbose("[CLIENTE] Resposta inesperada ao login: %T", respEnv.GetConteudo())
 		return false
 	}
 	res := respEnv.GetLoginRes()
 	if res.GetStatus() == protos.Status_STATUS_SUCESSO {
-		log.Printf("[CLIENTE] Login bem-sucedido para '%s'", nomeUsuario)
+		logVerbose("[CLIENTE] Login bem-sucedido para '%s'", nomeUsuario)
 		return true
 	}
-	log.Printf("[CLIENTE] Falha no login: %s", res.GetErroMsg())
+	logVerbose("[CLIENTE] Falha no login: %s", res.GetErroMsg())
 	return false
 }
 
@@ -200,19 +208,19 @@ func (c *Cliente) criarCanal(nomeCanal string) {
 
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
-		log.Printf("[CLIENTE] Erro ao criar canal: %v", err)
+		logVerbose("[CLIENTE] Erro ao criar canal: %v", err)
 		return
 	}
 	_, ok := respEnv.GetConteudo().(*protos.Envelope_CreateChannelRes)
 	if !ok {
-		log.Printf("[CLIENTE] Resposta inesperada a criação de canal: %T", respEnv.GetConteudo())
+		logVerbose("[CLIENTE] Resposta inesperada a criação de canal: %T", respEnv.GetConteudo())
 		return
 	}
 	res := respEnv.GetCreateChannelRes()
 	if res.GetStatus() == protos.Status_STATUS_SUCESSO {
-		log.Printf("[CLIENTE] Canal '%s' criado com sucesso", nomeCanal)
+		logVerbose("[CLIENTE] Canal '%s' criado com sucesso", nomeCanal)
 	} else {
-		log.Printf("[CLIENTE] Falha ao criar canal '%s': %s", nomeCanal, res.GetErroMsg())
+		logVerbose("[CLIENTE] Falha ao criar canal '%s': %s", nomeCanal, res.GetErroMsg())
 	}
 }
 
@@ -226,20 +234,20 @@ func (c *Cliente) listarCanais() []string {
 
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
-		log.Printf("[CLIENTE] Erro ao listar canais: %v", err)
+		logVerbose("[CLIENTE] Erro ao listar canais: %v", err)
 		return nil
 	}
 	_, ok := respEnv.GetConteudo().(*protos.Envelope_ListChannelsRes)
 	if !ok {
-		log.Printf("[CLIENTE] Resposta inesperada a listagem de canais: %T", respEnv.GetConteudo())
+		logVerbose("[CLIENTE] Resposta inesperada a listagem de canais: %T", respEnv.GetConteudo())
 		return nil
 	}
 	res := respEnv.GetListChannelsRes()
 	canais := res.GetCanais()
 	if len(canais) == 0 {
-		log.Printf("[CLIENTE] Canais existentes: (nenhum)")
+		logVerbose("[CLIENTE] Canais existentes: (nenhum)")
 	} else {
-		log.Printf("[CLIENTE] Canais existentes: %s", strings.Join(canais, ", "))
+		logVerbose("[CLIENTE] Canais existentes: %s", strings.Join(canais, ", "))
 	}
 	return canais
 }
@@ -253,16 +261,16 @@ func (c *Cliente) publicar(canal, mensagem string) bool {
 	}
 	respEnv, err := c.enviarEAguardar(env)
 	if err != nil {
-		log.Printf("[CLIENTE] Erro ao publicar: %v", err)
+		logVerbose("[CLIENTE] Erro ao publicar: %v", err)
 		return false
 	}
 	res, ok := respEnv.GetConteudo().(*protos.Envelope_PublishRes)
 	if !ok {
-		log.Printf("[CLIENTE] Resposta inesperada ao publicar: %T", respEnv.GetConteudo())
+		logVerbose("[CLIENTE] Resposta inesperada ao publicar: %T", respEnv.GetConteudo())
 		return false
 	}
 	if res.PublishRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[CLIENTE] Falha ao publicar em '%s': %s", canal, res.PublishRes.GetErroMsg())
+		logVerbose("[CLIENTE] Falha ao publicar em '%s': %s", canal, res.PublishRes.GetErroMsg())
 		return false
 	}
 	return true
@@ -275,11 +283,11 @@ func (c *Cliente) inscrever(canal string) {
 		return
 	}
 	if err := c.subSock.SetSubscribe(canal); err != nil {
-		log.Printf("[CLIENTE] Erro ao inscrever no canal '%s': %v", canal, err)
+		logVerbose("[CLIENTE] Erro ao inscrever no canal '%s': %v", canal, err)
 		return
 	}
 	c.subscribed[canal] = true
-	log.Printf("[CLIENTE] Inscrito no canal '%s'", canal)
+	logVerbose("[CLIENTE] Inscrito no canal '%s'", canal)
 }
 
 func (c *Cliente) iniciarReceptor() {
@@ -296,7 +304,7 @@ func (c *Cliente) iniciarReceptor() {
 				continue
 			}
 			c.clock.OnReceive(channelMsg.GetRelogioLogico())
-			log.Printf(
+			logVerbose(
 				"[CLIENTE] [CANAL=%s] msg='%s' remetente=%s envio=%s recebimento=%s relogio=%d",
 				string(msg[0]),
 				channelMsg.GetMensagem(),
