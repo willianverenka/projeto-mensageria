@@ -717,12 +717,12 @@ public class ServidorApp
 
     private bool SolicitarSnapshot(string nomeServidor)
     {
-        using var sock = new RequestSocket();
-        sock.Options.Linger = TimeSpan.Zero;
-        sock.Connect($"tcp://{nomeServidor}:{SnapshotPort}");
-
         try
         {
+            using var sock = new RequestSocket();
+            sock.Options.Linger = TimeSpan.Zero;
+            sock.Connect($"tcp://{nomeServidor}:{SnapshotPort}");
+
             var cab = Mensageria.NovoCabecalho(_origem, _relogio);
             var env = new Envelope
             {
@@ -1164,12 +1164,12 @@ public class ServidorApp
 
     private PeerReply? EnviarParaServidor(string nomeServidor, int porta, Envelope env, int timeoutMs)
     {
-        using var sock = new RequestSocket();
-        sock.Options.Linger = TimeSpan.Zero;
-        sock.Connect($"tcp://{nomeServidor}:{porta}");
-
         try
         {
+            using var sock = new RequestSocket();
+            sock.Options.Linger = TimeSpan.Zero;
+            sock.Connect($"tcp://{nomeServidor}:{porta}");
+
             var envioNs = Mensageria.AgoraNs();
             var timeout = TimeSpan.FromMilliseconds(timeoutMs);
             if (!sock.TrySendFrame(timeout, Mensageria.EnvelopeBytes(env), false))
@@ -1509,11 +1509,25 @@ public class ServidorApp
             _requestsProcessadas += 1;
             if (_requestsProcessadas % 10 == 0)
             {
-                HeartbeatESincronizar();
+                try
+                {
+                    HeartbeatESincronizar();
+                }
+                catch (Exception ex)
+                {
+                    LogVerbose($"[SERVIDOR] Erro ao executar heartbeat/snapshot: {ex.Message}");
+                }
             }
             if (_requestsProcessadas % 15 == 0)
             {
-                SincronizarRelogioFisico();
+                try
+                {
+                    SincronizarRelogioFisico();
+                }
+                catch (Exception ex)
+                {
+                    LogVerbose($"[SERVIDOR] Erro ao sincronizar relógio físico: {ex.Message}");
+                }
             }
         }
     }
