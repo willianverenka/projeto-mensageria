@@ -25,10 +25,12 @@ import shared.mensageria.RelogioProcesso;
 public class ServidorJava {
   private static final String TOPICO_COORDENADOR = "servers";
   private static final String TOPICO_REPLICA = "__replica__";
+  private static final String ERRO_SERVIDOR_NAO_REGISTRADO = "servidor não registrado";
   private static final int CLOCK_PORT = 5560;
   private static final int ELECTION_PORT = 5561;
   private static final int SNAPSHOT_PORT = 5562;
   private static final int REQUEST_TIMEOUT_MS = 2000;
+  private static final int TIMEOUT_TESTE_COORDENADOR = getEnvInt("TIMEOUT_TESTE_COORDENADOR", 500);
   private static final int SNAPSHOT_TIMEOUT_MS = 10000;
   private static final String LOG_MODE = getEnv("SERVER_LOG_MODE", "presentation").trim().toLowerCase();
 
@@ -49,6 +51,7 @@ public class ServidorJava {
   private final Object referenceLock = new Object();
   private final Object storageLock = new Object();
   private final Map<String, Integer> servidoresAtivos = new HashMap<>();
+  private final Map<String, Integer> ranksConhecidos = new HashMap<>();
 
   private int requestsProcessadas = 0;
   private String coordenadorAtual = "";
@@ -69,6 +72,10 @@ public class ServidorJava {
 
   private static void logEleicao(String message) {
     System.out.println("[ELEICAO] " + message);
+  }
+
+  private static void logEleicaoVerbose(String message) {
+    logVerbose("[ELEICAO] " + message);
   }
 
   public ServidorJava(
@@ -167,7 +174,11 @@ public class ServidorJava {
     if (res.getStatus() != Contrato.Status.STATUS_SUCESSO) {
       throw new IllegalStateException("Falha ao registrar na referência: " + res.getErroMsg());
     }
+    int rankAnterior = meuRank;
     meuRank = res.getRank();
+    if (rankAnterior > 0 && rankAnterior != meuRank) {
+      logVerbose("[SERVIDOR] Rank local atualizado de " + rankAnterior + " para " + meuRank + " após registro na referência");
+    }
     atualizarServidoresAtivos(List.of(
         Contrato.ServerInfo.newBuilder()
             .setNome(serverName)
@@ -175,6 +186,17 @@ public class ServidorJava {
             .build()
     ));
     logVerbose("[SERVIDOR] Servidor " + serverName + " registrado na referência com rank=" + res.getRank());
+  }
+
+  private boolean registrarNovamenteAposHeartbeat() {
+    try {
+      registrarNaReferencia();
+      logVerbose("[SERVIDOR] Heartbeat recuperado: servidor registrado novamente rank=" + meuRank);
+      return true;
+    } catch (Exception e) {
+      logVerbose("[SERVIDOR] Falha ao registrar novamente após heartbeat rejeitado: " + e.getMessage());
+      return false;
+    }
   }
 
   private List<Contrato.ServerInfo> listarServidoresReferencia() throws Exception {
@@ -217,17 +239,24 @@ public class ServidorJava {
         .build();
     Contrato.Envelope resp = enviarParaReferencia(env);
     if (resp.getConteudoCase() != Contrato.Envelope.ConteudoCase.HEARTBEAT_RES) {
-      System.err.println("[SERVIDOR] Resposta inesperada ao heartbeat: " + resp.getConteudoCase());
+      logVerbose("[SERVIDOR] Resposta inesperada ao heartbeat: " + resp.getConteudoCase());
       return;
     }
     Contrato.HeartbeatResponse res = resp.getHeartbeatRes();
     if (res.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      System.err.println("[SERVIDOR] Heartbeat rejeitado: " + res.getErroMsg());
-      return;
+      if (ERRO_SERVIDOR_NAO_REGISTRADO.equals(res.getErroMsg())) {
+        logVerbose("[SERVIDOR] Heartbeat rejeitado: servidor não registrado; registrando novamente");
+        if (!registrarNovamenteAposHeartbeat()) {
+          return;
+        }
+      } else {
+        logVerbose("[SERVIDOR] Heartbeat rejeitado: " + res.getErroMsg());
+        return;
+      }
+    } else {
+      logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
     }
-    logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
     listarServidoresReferencia();
-    avaliarEleicaoAposAtualizacao("heartbeat");
     sincronizarReplicas();
   }
 
@@ -1009,6 +1038,11 @@ public class ServidorJava {
 
   private void atualizarServidoresAtivos(List<Contrato.ServerInfo> servidores) {
     synchronized (stateLock) {
+      if (servidores != null) {
+        for (Contrato.ServerInfo servidor : servidores) {
+          ranksConhecidos.put(servidor.getNome(), (int) servidor.getRank());
+        }
+      }
       if (servidores != null && !servidores.isEmpty()) {
         servidoresAtivos.clear();
         for (Contrato.ServerInfo servidor : servidores) {
@@ -1020,9 +1054,23 @@ public class ServidorJava {
 
       if (meuRank > 0) {
         servidoresAtivos.put(serverName, meuRank);
+        ranksConhecidos.put(serverName, meuRank);
       }
     }
     logVerbose("[SERVIDOR] Lista ativa local atualizada: " + resumoServidores(servidoresAtivosSnapshot()));
+  }
+
+  private void restaurarServidorAtivoLocal(String nome) {
+    int rank;
+    synchronized (stateLock) {
+      rank = servidoresAtivos.getOrDefault(nome, ranksConhecidos.getOrDefault(nome, -1));
+      if (rank < 0) {
+        logVerbose("[SERVIDOR] Coordenador " + nome + " respondeu ao teste direto, mas rank local e desconhecido");
+        return;
+      }
+      servidoresAtivos.put(nome, rank);
+    }
+    logVerbose("[SERVIDOR] Coordenador " + nome + " respondeu ao teste direto; restaurado na lista ativa local rank=" + rank);
   }
 
   private String maiorServidorAtivo() {
@@ -1151,7 +1199,7 @@ public class ServidorJava {
       rankAnunciado = meuRank;
     }
     if (rankAnunciado < 0) {
-      logEleicao("anuncio ignorado coordenador=" + coordenador + " rank=desconhecido motivo=servidor_desconhecido");
+      logEleicaoVerbose("anuncio ignorado coordenador=" + coordenador + " rank=desconhecido motivo=servidor_desconhecido");
       return;
     }
 
@@ -1186,7 +1234,7 @@ public class ServidorJava {
       return;
     }
 
-    logEleicao(
+    logEleicaoVerbose(
         "anuncio ignorado coordenador=" + coordenador
             + " rank=" + rankAnunciado
             + " motivo=rank_menor_que_atual atual=" + atual
@@ -1223,7 +1271,7 @@ public class ServidorJava {
     }
   }
 
-  private PeerReply consultarRelogioServidor(String nomeServidor) {
+  private PeerReply consultarRelogioServidor(String nomeServidor, int timeoutMs) {
     Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
     Contrato.HeartbeatRequest req = Contrato.HeartbeatRequest.newBuilder()
         .setCabecalho(cab)
@@ -1234,7 +1282,7 @@ public class ServidorJava {
         .setHeartbeatReq(req)
         .build();
     logVerbose("[SERVIDOR] Enviando heartbeat_req para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
-    PeerReply reply = enviarParaServidor(nomeServidor, CLOCK_PORT, env, REQUEST_TIMEOUT_MS);
+    PeerReply reply = enviarParaServidor(nomeServidor, CLOCK_PORT, env, timeoutMs);
     if (reply == null) {
       logVerbose("[SERVIDOR] Sem resposta de relógio de " + nomeServidor);
       return null;
@@ -1263,40 +1311,40 @@ public class ServidorJava {
         .setRegisterServerReq(req)
         .build();
     if (registrarLogs) {
-      logEleicao("req destino=" + nomeServidor);
+      logEleicaoVerbose("req destino=" + nomeServidor);
     }
     PeerReply reply = enviarParaServidor(nomeServidor, ELECTION_PORT, env, REQUEST_TIMEOUT_MS);
     if (reply == null) {
       if (registrarLogs) {
-        logEleicao("sem_resposta destino=" + nomeServidor);
+        logEleicaoVerbose("sem_resposta destino=" + nomeServidor);
       }
       return false;
     }
     if (reply.envelope.getConteudoCase() != Contrato.Envelope.ConteudoCase.REGISTER_SERVER_RES) {
       if (registrarLogs) {
-        logEleicao("resposta_invalida destino=" + nomeServidor);
+        logEleicaoVerbose("resposta_invalida destino=" + nomeServidor);
       }
       return false;
     }
     Contrato.RegisterServerResponse resposta = reply.envelope.getRegisterServerRes();
     if (resposta.getStatus() != Contrato.Status.STATUS_SUCESSO) {
       if (registrarLogs) {
-        logEleicao("rejeitada destino=" + nomeServidor + " motivo=" + resposta.getErroMsg());
+        logEleicaoVerbose("rejeitada destino=" + nomeServidor + " motivo=" + resposta.getErroMsg());
       }
       return false;
     }
     if (registrarLogs) {
-      logEleicao("ok origem=" + nomeServidor + " rank=" + resposta.getRank());
+      logEleicaoVerbose("ok origem=" + nomeServidor + " rank=" + resposta.getRank());
     }
     return true;
   }
 
-  private boolean sincronizarComoSeguidor(String coordenador) {
+  private boolean sincronizarComoSeguidor(String coordenador, int timeoutMs) {
     if (coordenador == null || coordenador.isBlank()) {
       return false;
     }
 
-    PeerReply reply = consultarRelogioServidor(coordenador);
+    PeerReply reply = consultarRelogioServidor(coordenador, timeoutMs);
     if (reply == null) {
       return false;
     }
@@ -1324,7 +1372,7 @@ public class ServidorJava {
       if (servidor.getNome().equals(serverName)) {
         continue;
       }
-      PeerReply reply = consultarRelogioServidor(servidor.getNome());
+      PeerReply reply = consultarRelogioServidor(servidor.getNome(), REQUEST_TIMEOUT_MS);
       if (reply == null) {
         falhas.add(servidor.getNome());
         continue;
@@ -1375,11 +1423,20 @@ public class ServidorJava {
     }
 
     if (!coordenador.isBlank() && !coordenadorAtivo) {
-      iniciarEleicaoAsync("coordenador_ausente_da_lista");
+      logVerbose(
+          "[SERVIDOR] Coordenador " + coordenador
+              + " ausente da lista da referencia; testando diretamente com timeout="
+              + TIMEOUT_TESTE_COORDENADOR + "ms"
+      );
+      if (sincronizarComoSeguidor(coordenador, TIMEOUT_TESTE_COORDENADOR)) {
+        restaurarServidorAtivoLocal(coordenador);
+        return;
+      }
+      iniciarEleicaoAsync("coordenador_indisponivel_apos_teste");
       return;
     }
 
-    if (!coordenador.isBlank() && sincronizarComoSeguidor(coordenador)) {
+    if (!coordenador.isBlank() && sincronizarComoSeguidor(coordenador, REQUEST_TIMEOUT_MS)) {
       return;
     }
 
@@ -1423,7 +1480,7 @@ public class ServidorJava {
     if (meuRank > rankSolicitante) {
       resposta.setStatus(Contrato.Status.STATUS_SUCESSO);
       resposta.setRank(meuRank);
-      logEleicao("ok enviado destino=" + solicitante + " rank=" + meuRank + " solicitante_rank=" + rankSolicitante);
+      logEleicaoVerbose("ok enviado destino=" + solicitante + " rank=" + meuRank + " solicitante_rank=" + rankSolicitante);
       if (isCoordenador()) {
         anunciarCoordenador();
       } else {
@@ -1435,13 +1492,13 @@ public class ServidorJava {
     resposta.setStatus(Contrato.Status.STATUS_ERRO);
     resposta.setErroMsg("rank inferior");
     resposta.setRank(meuRank);
-    logEleicao("pedido ignorado origem=" + solicitante + " motivo=rank_inferior solicitante_rank=" + rankSolicitante + " meu_rank=" + meuRank);
+    logEleicaoVerbose("pedido ignorado origem=" + solicitante + " motivo=rank_inferior solicitante_rank=" + rankSolicitante + " meu_rank=" + meuRank);
     return resposta.build();
   }
 
   private int rankServidor(String nome) {
     synchronized (stateLock) {
-      return servidoresAtivos.getOrDefault(nome, -1);
+      return servidoresAtivos.getOrDefault(nome, ranksConhecidos.getOrDefault(nome, -1));
     }
   }
 
@@ -1519,6 +1576,18 @@ public class ServidorJava {
   private static String getEnv(String name, String defaultValue) {
     String v = System.getenv(name);
     return (v == null || v.isEmpty()) ? defaultValue : v;
+  }
+
+  private static int getEnvInt(String name, int defaultValue) {
+    String v = System.getenv(name);
+    if (v == null || v.isBlank()) {
+      return defaultValue;
+    }
+    try {
+      return Integer.parseInt(v.trim());
+    } catch (NumberFormatException e) {
+      return defaultValue;
+    }
   }
 
   private static void configurarConsoleUtf8() {

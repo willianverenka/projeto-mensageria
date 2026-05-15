@@ -11,6 +11,7 @@ public class ServidorApp
 {
     private const string TopicoCoordenador = "servers";
     private const string TopicoReplica = "__replica__";
+    private const string ErroServidorNaoRegistrado = "servidor não registrado";
     private const int ClockPort = 5560;
     private const int ElectionPort = 5561;
     private const int SnapshotPort = 5562;
@@ -18,6 +19,7 @@ public class ServidorApp
     private const int SnapshotTimeoutMs = 10000;
     private static readonly string LogMode =
         (Environment.GetEnvironmentVariable("SERVER_LOG_MODE") ?? "presentation").Trim().ToLowerInvariant();
+    private static readonly int TimeoutTesteCoordenador = GetEnvInt("TIMEOUT_TESTE_COORDENADOR", 500);
 
     private readonly string _orqEndpoint;
     private readonly string _proxyPubEndpoint;
@@ -39,6 +41,7 @@ public class ServidorApp
     private readonly object _storageLock = new();
     private readonly RelogioProcesso _relogio = new();
     private readonly Dictionary<string, int> _servidoresAtivos = new();
+    private readonly Dictionary<string, int> _ranksConhecidos = new();
     private string _coordenadorAtual = "";
     private int _meuRank = 0;
     private bool _electionRunning = false;
@@ -57,6 +60,17 @@ public class ServidorApp
     private static void LogEleicao(string message)
     {
         Console.WriteLine($"[ELEICAO] {message}");
+    }
+
+    private static void LogEleicaoVerbose(string message)
+    {
+        LogVerbose($"[ELEICAO] {message}");
+    }
+
+    private static int GetEnvInt(string name, int defaultValue)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(value, out var parsed) ? parsed : defaultValue;
     }
 
     public ServidorApp()
@@ -148,9 +162,29 @@ public class ServidorApp
             throw new InvalidOperationException($"Falha ao registrar na referência: {resp.RegisterServerRes.ErroMsg}");
         }
 
+        var rankAnterior = _meuRank;
         _meuRank = resp.RegisterServerRes.Rank;
+        if (rankAnterior > 0 && rankAnterior != _meuRank)
+        {
+            LogVerbose($"[SERVIDOR] Rank local atualizado de {rankAnterior} para {_meuRank} após registro na referência");
+        }
         AtualizarServidoresAtivos([new ServerInfo { Nome = _serverName, Rank = _meuRank }]);
         LogVerbose($"[SERVIDOR] Servidor {_serverName} registrado na referência com rank={resp.RegisterServerRes.Rank}");
+    }
+
+    private bool RegistrarNovamenteAposHeartbeat()
+    {
+        try
+        {
+            RegistrarNaReferencia();
+            LogVerbose($"[SERVIDOR] Heartbeat recuperado: servidor registrado novamente rank={_meuRank}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogVerbose($"[SERVIDOR] Falha ao registrar novamente após heartbeat rejeitado: {ex.Message}");
+            return false;
+        }
     }
 
     private List<ServerInfo> ListarServidoresReferencia()
@@ -197,19 +231,32 @@ public class ServidorApp
         var resp = EnviarParaReferencia(env);
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.HeartbeatRes)
         {
-            Console.WriteLine($"[SERVIDOR] Resposta inesperada ao heartbeat: {resp.ConteudoCase}");
+            LogVerbose($"[SERVIDOR] Resposta inesperada ao heartbeat: {resp.ConteudoCase}");
             return;
         }
 
         if (resp.HeartbeatRes.Status != Status.Sucesso)
         {
-            Console.WriteLine($"[SERVIDOR] Heartbeat rejeitado: {resp.HeartbeatRes.ErroMsg}");
-            return;
+            if (resp.HeartbeatRes.ErroMsg == ErroServidorNaoRegistrado)
+            {
+                LogVerbose("[SERVIDOR] Heartbeat rejeitado: servidor não registrado; registrando novamente");
+                if (!RegistrarNovamenteAposHeartbeat())
+                {
+                    return;
+                }
+            }
+            else
+            {
+                LogVerbose($"[SERVIDOR] Heartbeat rejeitado: {resp.HeartbeatRes.ErroMsg}");
+                return;
+            }
+        }
+        else
+        {
+            LogVerbose($"[SERVIDOR] Heartbeat enviado com sucesso para {_serverName}");
         }
 
-        LogVerbose($"[SERVIDOR] Heartbeat enviado com sucesso para {_serverName}");
         ListarServidoresReferencia();
-        AvaliarEleicaoAposAtualizacao("heartbeat");
         SincronizarReplicas();
     }
 
@@ -916,6 +963,14 @@ public class ServidorApp
     {
         lock (_stateLock)
         {
+            if (servidores != null)
+            {
+                foreach (var servidor in servidores)
+                {
+                    _ranksConhecidos[servidor.Nome] = servidor.Rank;
+                }
+            }
+
             if (servidores != null && servidores.Any())
             {
                 _servidoresAtivos.Clear();
@@ -932,10 +987,28 @@ public class ServidorApp
             if (_meuRank > 0)
             {
                 _servidoresAtivos[_serverName] = _meuRank;
+                _ranksConhecidos[_serverName] = _meuRank;
             }
         }
 
         LogVerbose($"[SERVIDOR] Lista ativa local atualizada: {ResumoServidores(ServidoresAtivosSnapshot())}");
+    }
+
+    private void RestaurarServidorAtivoLocal(string nome)
+    {
+        int rank;
+        lock (_stateLock)
+        {
+            if (!_servidoresAtivos.TryGetValue(nome, out rank)
+                && !_ranksConhecidos.TryGetValue(nome, out rank))
+            {
+                LogVerbose($"[SERVIDOR] Coordenador {nome} respondeu ao teste direto, mas rank local e desconhecido");
+                return;
+            }
+            _servidoresAtivos[nome] = rank;
+        }
+
+        LogVerbose($"[SERVIDOR] Coordenador {nome} respondeu ao teste direto; restaurado na lista ativa local rank={rank}");
     }
 
     private string MaiorServidorAtivo()
@@ -1087,7 +1160,7 @@ public class ServidorApp
 
         if (rankAnunciado < 0)
         {
-            LogEleicao($"anuncio ignorado coordenador={coordenador} rank=desconhecido motivo=servidor_desconhecido");
+            LogEleicaoVerbose($"anuncio ignorado coordenador={coordenador} rank=desconhecido motivo=servidor_desconhecido");
             return;
         }
 
@@ -1123,7 +1196,7 @@ public class ServidorApp
             return;
         }
 
-        LogEleicao($"anuncio ignorado coordenador={coordenador} rank={rankAnunciado} motivo=rank_menor_que_atual atual={atual}");
+        LogEleicaoVerbose($"anuncio ignorado coordenador={coordenador} rank={rankAnunciado} motivo=rank_menor_que_atual atual={atual}");
     }
 
     private static long TimestampToNs(global::Google.Protobuf.WellKnownTypes.Timestamp timestamp)
@@ -1161,7 +1234,7 @@ public class ServidorApp
         }
     }
 
-    private PeerReply? ConsultarRelogioServidor(string nomeServidor)
+    private PeerReply? ConsultarRelogioServidor(string nomeServidor, int timeoutMs)
     {
         var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var req = new HeartbeatRequest
@@ -1176,7 +1249,7 @@ public class ServidorApp
         };
 
         LogVerbose($"[SERVIDOR] Enviando heartbeat_req para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
-        var reply = EnviarParaServidor(nomeServidor, ClockPort, env, RequestTimeoutMs);
+        var reply = EnviarParaServidor(nomeServidor, ClockPort, env, timeoutMs);
         if (reply is null)
         {
             LogVerbose($"[SERVIDOR] Sem resposta de relógio de {nomeServidor}");
@@ -1216,14 +1289,14 @@ public class ServidorApp
 
         if (registrarLogs)
         {
-            LogEleicao($"req destino={nomeServidor}");
+            LogEleicaoVerbose($"req destino={nomeServidor}");
         }
         var reply = EnviarParaServidor(nomeServidor, ElectionPort, env, RequestTimeoutMs);
         if (reply is null)
         {
             if (registrarLogs)
             {
-                LogEleicao($"sem_resposta destino={nomeServidor}");
+                LogEleicaoVerbose($"sem_resposta destino={nomeServidor}");
             }
             return false;
         }
@@ -1232,7 +1305,7 @@ public class ServidorApp
         {
             if (registrarLogs)
             {
-                LogEleicao($"resposta_invalida destino={nomeServidor}");
+                LogEleicaoVerbose($"resposta_invalida destino={nomeServidor}");
             }
             return false;
         }
@@ -1242,26 +1315,26 @@ public class ServidorApp
         {
             if (registrarLogs)
             {
-                LogEleicao($"rejeitada destino={nomeServidor} motivo={resposta.ErroMsg}");
+                LogEleicaoVerbose($"rejeitada destino={nomeServidor} motivo={resposta.ErroMsg}");
             }
             return false;
         }
 
         if (registrarLogs)
         {
-            LogEleicao($"ok origem={nomeServidor} rank={resposta.Rank}");
+            LogEleicaoVerbose($"ok origem={nomeServidor} rank={resposta.Rank}");
         }
         return true;
     }
 
-    private bool SincronizarComoSeguidor(string coordenador)
+    private bool SincronizarComoSeguidor(string coordenador, int timeoutMs)
     {
         if (string.IsNullOrWhiteSpace(coordenador))
         {
             return false;
         }
 
-        var reply = ConsultarRelogioServidor(coordenador);
+        var reply = ConsultarRelogioServidor(coordenador, timeoutMs);
         if (reply is null)
         {
             return false;
@@ -1295,7 +1368,7 @@ public class ServidorApp
                 continue;
             }
 
-            var reply = ConsultarRelogioServidor(servidor.Nome);
+            var reply = ConsultarRelogioServidor(servidor.Nome, RequestTimeoutMs);
             if (reply is null)
             {
                 falhas.Add(servidor.Nome);
@@ -1339,11 +1412,18 @@ public class ServidorApp
         var coordenadorAtivo = ServidoresAtivosSnapshot().Any(servidor => servidor.Nome == coordenador);
         if (!string.IsNullOrWhiteSpace(coordenador) && !coordenadorAtivo)
         {
-            IniciarEleicaoAsync("coordenador_ausente_da_lista");
+            LogVerbose($"[SERVIDOR] Coordenador {coordenador} ausente da lista da referencia; testando diretamente com timeout={TimeoutTesteCoordenador}ms");
+            if (SincronizarComoSeguidor(coordenador, TimeoutTesteCoordenador))
+            {
+                RestaurarServidorAtivoLocal(coordenador);
+                return;
+            }
+
+            IniciarEleicaoAsync("coordenador_indisponivel_apos_teste");
             return;
         }
 
-        if (!string.IsNullOrWhiteSpace(coordenador) && SincronizarComoSeguidor(coordenador))
+        if (!string.IsNullOrWhiteSpace(coordenador) && SincronizarComoSeguidor(coordenador, RequestTimeoutMs))
         {
             return;
         }
@@ -1395,7 +1475,7 @@ public class ServidorApp
         {
             resposta.Status = Status.Sucesso;
             resposta.Rank = _meuRank;
-            LogEleicao($"ok enviado destino={solicitante} rank={_meuRank} solicitante_rank={rankSolicitante}");
+            LogEleicaoVerbose($"ok enviado destino={solicitante} rank={_meuRank} solicitante_rank={rankSolicitante}");
             if (IsCoordenador())
             {
                 AnunciarCoordenador();
@@ -1410,7 +1490,7 @@ public class ServidorApp
         resposta.Status = Status.Erro;
         resposta.ErroMsg = "rank inferior";
         resposta.Rank = _meuRank;
-        LogEleicao($"pedido ignorado origem={solicitante} motivo=rank_inferior solicitante_rank={rankSolicitante} meu_rank={_meuRank}");
+        LogEleicaoVerbose($"pedido ignorado origem={solicitante} motivo=rank_inferior solicitante_rank={rankSolicitante} meu_rank={_meuRank}");
         return resposta;
     }
 
@@ -1418,7 +1498,11 @@ public class ServidorApp
     {
         lock (_stateLock)
         {
-            return _servidoresAtivos.TryGetValue(nome, out var rank) ? rank : -1;
+            if (_servidoresAtivos.TryGetValue(nome, out var rank))
+            {
+                return rank;
+            }
+            return _ranksConhecidos.TryGetValue(nome, out rank) ? rank : -1;
         }
     }
 

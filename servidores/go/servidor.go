@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,21 +21,25 @@ import (
 )
 
 const (
-	orqEndpointDefault = "tcp://orquestrador:5556"
-	proxyPubEndpoint   = "tcp://proxy:5557"
-	proxySubEndpoint   = "tcp://proxy:5558"
-	referenceEndpoint  = "tcp://referencia:5559"
-	dataDirDefault     = "/data"
-	clockPort          = 5560
-	electionPort       = 5561
-	snapshotPort       = 5562
-	requestTimeout     = 2 * time.Second
-	snapshotTimeout    = 10 * time.Second
-	topicoCoordenador  = "servers"
-	topicoReplica      = "__replica__"
+	orqEndpointDefault        = "tcp://orquestrador:5556"
+	proxyPubEndpoint          = "tcp://proxy:5557"
+	proxySubEndpoint          = "tcp://proxy:5558"
+	referenceEndpoint         = "tcp://referencia:5559"
+	dataDirDefault            = "/data"
+	clockPort                 = 5560
+	electionPort              = 5561
+	snapshotPort              = 5562
+	requestTimeout            = 2 * time.Second
+	snapshotTimeout           = 10 * time.Second
+	topicoCoordenador         = "servers"
+	topicoReplica             = "__replica__"
+	erroServidorNaoRegistrado = "servidor não registrado"
 )
 
-var logMode = strings.ToLower(strings.TrimSpace(getEnv("SERVER_LOG_MODE", "presentation")))
+var (
+	logMode                 = strings.ToLower(strings.TrimSpace(getEnv("SERVER_LOG_MODE", "presentation")))
+	timeoutTesteCoordenador = time.Duration(getEnvInt("TIMEOUT_TESTE_COORDENADOR", 500)) * time.Millisecond
+)
 
 func init() {
 	if logMode == "" {
@@ -50,6 +55,10 @@ func logVerbose(format string, args ...any) {
 
 func logEleicao(format string, args ...any) {
 	log.Printf("[ELEICAO] "+format, args...)
+}
+
+func logEleicaoVerbose(format string, args ...any) {
+	logVerbose("[ELEICAO] "+format, args...)
 }
 
 func main() {
@@ -83,6 +92,7 @@ func main() {
 		clock:             &mensageria.RelogioProcesso{},
 		origem:            mensageria.OrigemLabel(mensageria.RoleServidor),
 		activeServers:     map[string]int32{},
+		knownRanks:        map[string]int32{},
 	}
 	defer server.pubSock.Close()
 	defer server.announceSock.Close()
@@ -120,6 +130,7 @@ type Servidor struct {
 	refMu             sync.Mutex
 	coordenador       string
 	activeServers     map[string]int32
+	knownRanks        map[string]int32
 	myRank            int32
 	electionRunning   bool
 }
@@ -192,6 +203,18 @@ func getEnv(name, defaultVal string) string {
 	return defaultVal
 }
 
+func getEnvInt(name string, defaultVal int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
 func conteudoNome(env *protos.Envelope) string {
 	switch env.GetConteudo().(type) {
 	case *protos.Envelope_LoginReq:
@@ -243,6 +266,12 @@ func (s *Servidor) initStorage() {
 }
 
 func (s *Servidor) registrarNaReferencia() {
+	if err := s.registrarNaReferenciaSeguro(); err != nil {
+		log.Fatalf("[SERVIDOR] %v", err)
+	}
+}
+
+func (s *Servidor) registrarNaReferenciaSeguro() error {
 	cab := mensageria.NovoCabecalho(s.origem, s.clock)
 	req := &protos.RegisterServerRequest{Cabecalho: cab, NomeServidor: s.serverName}
 	env := &protos.Envelope{
@@ -251,18 +280,32 @@ func (s *Servidor) registrarNaReferencia() {
 	}
 	resp, err := s.enviarParaReferencia(env, true)
 	if err != nil {
-		log.Fatalf("[SERVIDOR] Erro ao registrar na referência: %v", err)
+		return fmt.Errorf("erro ao registrar na referência: %w", err)
 	}
 	res, ok := resp.GetConteudo().(*protos.Envelope_RegisterServerRes)
 	if !ok {
-		log.Fatalf("[SERVIDOR] Resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
+		return fmt.Errorf("resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
 	}
 	if res.RegisterServerRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Fatalf("[SERVIDOR] Falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
+		return fmt.Errorf("falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
 	}
+	rankAnterior := s.myRank
 	s.myRank = res.RegisterServerRes.GetRank()
+	if rankAnterior > 0 && rankAnterior != s.myRank {
+		logVerbose("[SERVIDOR] Rank local atualizado de %d para %d após registro na referência", rankAnterior, s.myRank)
+	}
 	s.atualizarServidoresAtivos([]*protos.ServerInfo{{Nome: s.serverName, Rank: s.myRank}})
 	logVerbose("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
+	return nil
+}
+
+func (s *Servidor) registrarNovamenteAposHeartbeat() bool {
+	if err := s.registrarNaReferenciaSeguro(); err != nil {
+		logVerbose("[SERVIDOR] Falha ao registrar novamente após heartbeat rejeitado: %v", err)
+		return false
+	}
+	logVerbose("[SERVIDOR] Heartbeat recuperado: servidor registrado novamente rank=%d", s.myRank)
+	return true
 }
 
 func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
@@ -307,21 +350,28 @@ func (s *Servidor) heartbeatESincronizar() {
 	}
 	resp, err := s.enviarParaReferencia(env, true)
 	if err != nil {
-		log.Printf("[SERVIDOR] Erro ao enviar heartbeat: %v", err)
+		logVerbose("[SERVIDOR] Erro ao enviar heartbeat: %v", err)
 		return
 	}
 	res, ok := resp.GetConteudo().(*protos.Envelope_HeartbeatRes)
 	if !ok {
-		log.Printf("[SERVIDOR] Resposta inesperada ao heartbeat: %T", resp.GetConteudo())
+		logVerbose("[SERVIDOR] Resposta inesperada ao heartbeat: %T", resp.GetConteudo())
 		return
 	}
 	if res.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
-		return
+		if res.HeartbeatRes.GetErroMsg() == erroServidorNaoRegistrado {
+			logVerbose("[SERVIDOR] Heartbeat rejeitado: servidor não registrado; registrando novamente")
+			if !s.registrarNovamenteAposHeartbeat() {
+				return
+			}
+		} else {
+			logVerbose("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
+			return
+		}
+	} else {
+		logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
 	}
-	logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
 	s.listarServidoresReferencia()
-	s.avaliarEleicaoAposAtualizacao("heartbeat")
 	s.sincronizarReplicas()
 }
 
@@ -1137,6 +1187,9 @@ func (s *Servidor) resumoServidores(servidores []*protos.ServerInfo) string {
 
 func (s *Servidor) atualizarServidoresAtivos(servidores []*protos.ServerInfo) {
 	s.stateMu.Lock()
+	for _, servidor := range servidores {
+		s.knownRanks[servidor.GetNome()] = servidor.GetRank()
+	}
 	if len(servidores) > 0 {
 		s.activeServers = make(map[string]int32, len(servidores))
 		for _, servidor := range servidores {
@@ -1147,10 +1200,28 @@ func (s *Servidor) atualizarServidoresAtivos(servidores []*protos.ServerInfo) {
 	}
 	if s.myRank > 0 {
 		s.activeServers[s.serverName] = s.myRank
+		s.knownRanks[s.serverName] = s.myRank
 	}
 	s.stateMu.Unlock()
 
 	logVerbose("[SERVIDOR] Lista ativa local atualizada: %s", s.resumoServidores(s.servidoresAtivosSnapshot()))
+}
+
+func (s *Servidor) restaurarServidorAtivoLocal(nome string) {
+	s.stateMu.Lock()
+	rank, ok := s.activeServers[nome]
+	if !ok {
+		rank, ok = s.knownRanks[nome]
+	}
+	if !ok {
+		s.stateMu.Unlock()
+		logVerbose("[SERVIDOR] Coordenador %s respondeu ao teste direto, mas rank local e desconhecido", nome)
+		return
+	}
+	s.activeServers[nome] = rank
+	s.stateMu.Unlock()
+
+	logVerbose("[SERVIDOR] Coordenador %s respondeu ao teste direto; restaurado na lista ativa local rank=%d", nome, rank)
 }
 
 func (s *Servidor) maiorServidorAtivo() string {
@@ -1286,7 +1357,7 @@ func (s *Servidor) processarAnuncioCoordenador(coordenador, remetente string) {
 		ok = true
 	}
 	if !ok {
-		logEleicao("anuncio ignorado coordenador=%s rank=desconhecido motivo=servidor_desconhecido", coordenador)
+		logEleicaoVerbose("anuncio ignorado coordenador=%s rank=desconhecido motivo=servidor_desconhecido", coordenador)
 		return
 	}
 
@@ -1322,7 +1393,7 @@ func (s *Servidor) processarAnuncioCoordenador(coordenador, remetente string) {
 		return
 	}
 
-	logEleicao(
+	logEleicaoVerbose(
 		"anuncio ignorado coordenador=%s rank=%d motivo=rank_menor_que_atual atual=%s",
 		coordenador,
 		rankAnunciado,
@@ -1394,12 +1465,12 @@ func (s *Servidor) consultarEleicaoServidor(nomeServidor string, registrarLogs b
 		Conteudo:  &protos.Envelope_RegisterServerReq{RegisterServerReq: req},
 	}
 	if registrarLogs {
-		logEleicao("req destino=%s", nomeServidor)
+		logEleicaoVerbose("req destino=%s", nomeServidor)
 	}
 	resp, _, _, err := s.enviarParaServidor(nomeServidor, electionPort, env, requestTimeout)
 	if err != nil {
 		if registrarLogs {
-			logEleicao("sem_resposta destino=%s", nomeServidor)
+			logEleicaoVerbose("sem_resposta destino=%s", nomeServidor)
 		}
 		return false
 	}
@@ -1407,23 +1478,23 @@ func (s *Servidor) consultarEleicaoServidor(nomeServidor string, registrarLogs b
 	resposta, ok := resp.GetConteudo().(*protos.Envelope_RegisterServerRes)
 	if !ok {
 		if registrarLogs {
-			logEleicao("resposta_invalida destino=%s", nomeServidor)
+			logEleicaoVerbose("resposta_invalida destino=%s", nomeServidor)
 		}
 		return false
 	}
 	if resposta.RegisterServerRes.GetStatus() != protos.Status_STATUS_SUCESSO {
 		if registrarLogs {
-			logEleicao("rejeitada destino=%s motivo=%s", nomeServidor, resposta.RegisterServerRes.GetErroMsg())
+			logEleicaoVerbose("rejeitada destino=%s motivo=%s", nomeServidor, resposta.RegisterServerRes.GetErroMsg())
 		}
 		return false
 	}
 	if registrarLogs {
-		logEleicao("ok origem=%s rank=%d", nomeServidor, resposta.RegisterServerRes.GetRank())
+		logEleicaoVerbose("ok origem=%s rank=%d", nomeServidor, resposta.RegisterServerRes.GetRank())
 	}
 	return true
 }
 
-func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
+func (s *Servidor) sincronizarComoSeguidor(coordenador string, timeout time.Duration) bool {
 	if coordenador == "" {
 		return false
 	}
@@ -1434,7 +1505,7 @@ func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
 		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
 	}
 
-	resp, envioNs, recebimentoNs, err := s.enviarParaServidor(coordenador, clockPort, env, requestTimeout)
+	resp, envioNs, recebimentoNs, err := s.enviarParaServidor(coordenador, clockPort, env, timeout)
 	if err != nil {
 		logVerbose("[SERVIDOR] Falha ao sincronizar com coordenador %s: %v", coordenador, err)
 		return false
@@ -1508,11 +1579,20 @@ func (s *Servidor) sincronizarRelogioFisico() {
 		ativos[servidor.GetNome()] = true
 	}
 	if coordenador != "" && !ativos[coordenador] {
-		s.iniciarEleicaoAsync("coordenador_ausente_da_lista")
+		logVerbose(
+			"[SERVIDOR] Coordenador %s ausente da lista da referencia; testando diretamente com timeout=%dms",
+			coordenador,
+			timeoutTesteCoordenador.Milliseconds(),
+		)
+		if s.sincronizarComoSeguidor(coordenador, timeoutTesteCoordenador) {
+			s.restaurarServidorAtivoLocal(coordenador)
+			return
+		}
+		s.iniciarEleicaoAsync("coordenador_indisponivel_apos_teste")
 		return
 	}
 
-	if coordenador != "" && s.sincronizarComoSeguidor(coordenador) {
+	if coordenador != "" && s.sincronizarComoSeguidor(coordenador, requestTimeout) {
 		return
 	}
 
@@ -1560,7 +1640,7 @@ func (s *Servidor) processarPedidoEleicao(req *protos.RegisterServerRequest) *pr
 	if s.myRank > rankSolicitante {
 		resposta.Status = protos.Status_STATUS_SUCESSO
 		resposta.Rank = s.myRank
-		logEleicao("ok enviado destino=%s rank=%d solicitante_rank=%d", solicitante, s.myRank, rankSolicitante)
+		logEleicaoVerbose("ok enviado destino=%s rank=%d solicitante_rank=%d", solicitante, s.myRank, rankSolicitante)
 		if s.isCoordenador() {
 			s.anunciarCoordenador()
 		} else {
@@ -1572,7 +1652,7 @@ func (s *Servidor) processarPedidoEleicao(req *protos.RegisterServerRequest) *pr
 	resposta.Status = protos.Status_STATUS_ERRO
 	resposta.ErroMsg = "rank inferior"
 	resposta.Rank = s.myRank
-	logEleicao("pedido ignorado origem=%s motivo=rank_inferior solicitante_rank=%d meu_rank=%d", solicitante, rankSolicitante, s.myRank)
+	logEleicaoVerbose("pedido ignorado origem=%s motivo=rank_inferior solicitante_rank=%d meu_rank=%d", solicitante, rankSolicitante, s.myRank)
 	return resposta
 }
 
@@ -1580,6 +1660,10 @@ func (s *Servidor) rankServidor(nome string) (int32, bool) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	rank, ok := s.activeServers[nome]
+	if ok {
+		return rank, true
+	}
+	rank, ok = s.knownRanks[nome]
 	return rank, ok
 }
 

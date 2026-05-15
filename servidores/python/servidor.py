@@ -36,10 +36,12 @@ CLOCK_PORT = 5560
 ELECTION_PORT = 5561
 SNAPSHOT_PORT = 5562
 REQUEST_TIMEOUT_MS = 2000
+TIMEOUT_TESTE_COORDENADOR = int(os.getenv("TIMEOUT_TESTE_COORDENADOR", "500"))
 SNAPSHOT_TIMEOUT_MS = 10000
 TOPICO_COORDENADOR = "servers"
 TOPICO_REPLICA = "__replica__"
 LOG_MODE = os.getenv("SERVER_LOG_MODE", "presentation").strip().lower() or "presentation"
+ERRO_SERVIDOR_NAO_REGISTRADO = "servidor não registrado"
 
 LOGINS_PATH = DATA_DIR / "logins.jsonl"
 CANAIS_PATH = DATA_DIR / "canais.json"
@@ -53,6 +55,10 @@ def _log_verbose(message: str, *args: object) -> None:
 
 def _log_eleicao(message: str, *args: object) -> None:
     logging.info("[ELEICAO] " + message, *args)
+
+
+def _log_eleicao_verbose(message: str, *args: object) -> None:
+    _log_verbose("[ELEICAO] " + message, *args)
 
 
 class Servidor:
@@ -81,6 +87,7 @@ class Servidor:
         self._reference_lock = threading.Lock()
         self._coordinator_name = ""
         self._active_servers: dict[str, int] = {}
+        self._known_server_ranks: dict[str, int] = {}
         self._my_rank = 0
         self._election_running = False
         _log_verbose("Servidor conectado ao orquestrador em %s", ORQ_ENDPOINT)
@@ -432,11 +439,30 @@ class Servidor:
         if res.status != contrato_pb2.STATUS_SUCESSO:
             raise RuntimeError(f"Falha ao registrar servidor na referência: {res.erro_msg}")
 
+        rank_anterior = self._my_rank
         self._my_rank = res.rank
+        if rank_anterior and rank_anterior != self._my_rank:
+            _log_verbose(
+                "Rank local atualizado de %s para %s após registro na referência",
+                rank_anterior,
+                self._my_rank,
+            )
         self._atualizar_servidores_ativos(
             [contrato_pb2.ServerInfo(nome=SERVER_NAME, rank=self._my_rank)]
         )
         _log_verbose("Servidor %s registrado na referência com rank=%s", SERVER_NAME, res.rank)
+
+    def _registrar_novamente_apos_heartbeat(self) -> bool:
+        try:
+            self._registrar_na_referencia()
+            _log_verbose(
+                "Heartbeat recuperado: servidor registrado novamente rank=%s",
+                self._my_rank,
+            )
+            return True
+        except Exception as exc:
+            _log_verbose("Falha ao registrar novamente após heartbeat rejeitado: %s", exc)
+            return False
 
     def _listar_servidores_referencia(self) -> list[contrato_pb2.ServerInfo]:
         env = contrato_pb2.Envelope()
@@ -466,17 +492,24 @@ class Servidor:
 
         resp_env, _, _ = self._enviar_para_referencia(env, atualizar_offset=True)
         if resp_env.WhichOneof("conteudo") != "heartbeat_res":
-            logging.warning("Resposta inesperada ao heartbeat")
+            _log_verbose("Resposta inesperada ao heartbeat")
             return
 
         res = resp_env.heartbeat_res
         if res.status != contrato_pb2.STATUS_SUCESSO:
-            logging.warning("Falha ao enviar heartbeat: %s", res.erro_msg)
-            return
+            if res.erro_msg == ERRO_SERVIDOR_NAO_REGISTRADO:
+                _log_verbose(
+                    "Heartbeat rejeitado: servidor não registrado; registrando novamente"
+                )
+                if not self._registrar_novamente_apos_heartbeat():
+                    return
+            else:
+                _log_verbose("Falha ao enviar heartbeat: %s", res.erro_msg)
+                return
+        else:
+            _log_verbose("Heartbeat enviado com sucesso para %s", SERVER_NAME)
 
-        _log_verbose("Heartbeat enviado com sucesso para %s", SERVER_NAME)
-        servidores = self._listar_servidores_referencia()
-        self._avaliar_eleicao_apos_atualizacao("heartbeat")
+        self._listar_servidores_referencia()
         self._sincronizar_replicas()
 
     def loop(self) -> None:
@@ -813,16 +846,36 @@ class Servidor:
 
     def _atualizar_servidores_ativos(self, servidores: list[contrato_pb2.ServerInfo]) -> None:
         with self._lock:
+            for item in servidores:
+                self._known_server_ranks[item.nome] = item.rank
             if servidores:
                 self._active_servers = {item.nome: item.rank for item in servidores}
             elif not self._active_servers and self._my_rank:
                 self._active_servers = {SERVER_NAME: self._my_rank}
             if self._my_rank:
                 self._active_servers[SERVER_NAME] = self._my_rank
+                self._known_server_ranks[SERVER_NAME] = self._my_rank
 
         _log_verbose(
             "Lista ativa local atualizada: %s",
             self._resumo_servidores(self._servidores_ativos_snapshot()),
+        )
+
+    def _restaurar_servidor_ativo_local(self, nome: str) -> None:
+        with self._lock:
+            rank = self._active_servers.get(nome) or self._known_server_ranks.get(nome)
+            if rank is None:
+                _log_verbose(
+                    "Coordenador %s respondeu ao teste direto, mas rank local e desconhecido",
+                    nome,
+                )
+                return
+            self._active_servers[nome] = rank
+
+        _log_verbose(
+            "Coordenador %s respondeu ao teste direto; restaurado na lista ativa local rank=%s",
+            nome,
+            rank,
         )
 
     def _maior_servidor_ativo(self) -> str:
@@ -929,7 +982,7 @@ class Servidor:
         if coordenador == SERVER_NAME:
             rank_anunciado = self._my_rank
         if rank_anunciado is None:
-            _log_eleicao(
+            _log_eleicao_verbose(
                 "anuncio ignorado coordenador=%s rank=desconhecido motivo=servidor_desconhecido",
                 coordenador,
             )
@@ -963,7 +1016,7 @@ class Servidor:
             )
             return
 
-        _log_eleicao(
+        _log_eleicao_verbose(
             "anuncio ignorado coordenador=%s rank=%s motivo=rank_menor_que_atual atual=%s",
             coordenador,
             rank_anunciado,
@@ -1043,32 +1096,38 @@ class Servidor:
         env.register_server_req.CopyFrom(req)
 
         if registrar_logs:
-            _log_eleicao("req destino=%s", nome_servidor)
+            _log_eleicao_verbose("req destino=%s", nome_servidor)
         resp_env, _, _ = self._enviar_para_servidor(
             nome_servidor, ELECTION_PORT, env, timeout_ms=REQUEST_TIMEOUT_MS
         )
         if resp_env is None:
             if registrar_logs:
-                _log_eleicao("sem_resposta destino=%s", nome_servidor)
+                _log_eleicao_verbose("sem_resposta destino=%s", nome_servidor)
             return False
         if resp_env.WhichOneof("conteudo") != "register_server_res":
             if registrar_logs:
-                _log_eleicao("resposta_invalida destino=%s", nome_servidor)
+                _log_eleicao_verbose("resposta_invalida destino=%s", nome_servidor)
             return False
         if resp_env.register_server_res.status != contrato_pb2.STATUS_SUCESSO:
             if registrar_logs:
-                _log_eleicao("rejeitada destino=%s motivo=%s", nome_servidor, resp_env.register_server_res.erro_msg)
+                _log_eleicao_verbose(
+                    "rejeitada destino=%s motivo=%s",
+                    nome_servidor,
+                    resp_env.register_server_res.erro_msg,
+                )
             return False
 
         if registrar_logs:
-            _log_eleicao(
-            "ok origem=%s rank=%s",
-            nome_servidor,
-            resp_env.register_server_res.rank,
+            _log_eleicao_verbose(
+                "ok origem=%s rank=%s",
+                nome_servidor,
+                resp_env.register_server_res.rank,
             )
         return True
 
-    def _sincronizar_como_seguidor(self, coordenador: str) -> bool:
+    def _sincronizar_como_seguidor(
+        self, coordenador: str, timeout_ms: int = REQUEST_TIMEOUT_MS
+    ) -> bool:
         if not coordenador:
             return False
 
@@ -1080,7 +1139,7 @@ class Servidor:
         env.heartbeat_req.CopyFrom(req)
 
         resp_env, envio_ns, recebimento_ns = self._enviar_para_servidor(
-            coordenador, CLOCK_PORT, env
+            coordenador, CLOCK_PORT, env, timeout_ms=timeout_ms
         )
         if resp_env is None:
             return False
@@ -1141,7 +1200,17 @@ class Servidor:
 
         ativos = {item.nome for item in self._servidores_ativos_snapshot()}
         if coordenador and coordenador not in ativos:
-            self._iniciar_eleicao_async("coordenador_ausente_da_lista")
+            _log_verbose(
+                "Coordenador %s ausente da lista da referencia; testando diretamente com timeout=%sms",
+                coordenador,
+                TIMEOUT_TESTE_COORDENADOR,
+            )
+            if self._sincronizar_como_seguidor(
+                coordenador, timeout_ms=TIMEOUT_TESTE_COORDENADOR
+            ):
+                self._restaurar_servidor_ativo_local(coordenador)
+                return
+            self._iniciar_eleicao_async("coordenador_indisponivel_apos_teste")
             return
 
         if coordenador and self._sincronizar_como_seguidor(coordenador):
@@ -1187,7 +1256,7 @@ class Servidor:
         if self._my_rank > rank_solicitante:
             resposta.status = contrato_pb2.STATUS_SUCESSO
             resposta.rank = self._my_rank
-            _log_eleicao(
+            _log_eleicao_verbose(
                 "ok enviado destino=%s rank=%s solicitante_rank=%s",
                 solicitante,
                 self._my_rank,
@@ -1202,7 +1271,7 @@ class Servidor:
         resposta.status = contrato_pb2.STATUS_ERRO
         resposta.erro_msg = "rank inferior"
         resposta.rank = self._my_rank
-        _log_eleicao(
+        _log_eleicao_verbose(
             "anuncio ignorado coordenador=%s rank=%s motivo=rank_inferior solicitante=%s",
             SERVER_NAME,
             self._my_rank,
@@ -1212,7 +1281,9 @@ class Servidor:
 
     def _rank_servidor(self, nome_servidor: str) -> int | None:
         with self._lock:
-            return self._active_servers.get(nome_servidor)
+            return self._active_servers.get(nome_servidor) or self._known_server_ranks.get(
+                nome_servidor
+            )
 
 
 def main() -> None:

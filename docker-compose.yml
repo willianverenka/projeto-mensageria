@@ -29,6 +29,7 @@ services:
     command: ["python", "referencia.py"]
     environment:
       - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
+      - HEARTBEAT_TIMEOUT_SECONDS=${HEARTBEAT_TIMEOUT_SECONDS:-30}
     ports:
       - "5559:5559"
 
@@ -45,6 +46,7 @@ services:
       - SERVER_NAME=servidor_python
       - DATA_DIR=/data
       - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
+      - TIMEOUT_TESTE_COORDENADOR=${TIMEOUT_TESTE_COORDENADOR:-500}
     volumes:
       - ./dados/servidor_python:/data
     depends_on:
@@ -82,6 +84,7 @@ services:
       - SERVER_NAME=servidor_go
       - DATA_DIR=/data
       - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
+      - TIMEOUT_TESTE_COORDENADOR=${TIMEOUT_TESTE_COORDENADOR:-500}
     volumes:
       - ./dados/servidor_go:/data
     depends_on:
@@ -119,6 +122,7 @@ services:
       - SERVER_NAME=servidor_java
       - DATA_DIR=/data
       - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
+      - TIMEOUT_TESTE_COORDENADOR=${TIMEOUT_TESTE_COORDENADOR:-500}
     volumes:
       - ./dados/servidor_java:/data
     depends_on:
@@ -155,6 +159,7 @@ services:
       - SERVER_NAME=servidor_csharp
       - DATA_DIR=/data
       - SERVER_LOG_MODE=${SERVER_LOG_MODE:-presentation}
+      - TIMEOUT_TESTE_COORDENADOR=${TIMEOUT_TESTE_COORDENADOR:-500}
     volumes:
       - ./dados/servidor_csharp:/data
     depends_on:

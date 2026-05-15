@@ -1,10 +1,3 @@
-# Projeto Mensageria
-
-Sistema distribuído de troca de mensagens com clientes/bots e servidores em
-Python, Go, Java e C#. A comunicação entre clientes e servidores usa ZeroMQ
-com mensagens binárias em Protocol Buffers. As publicações em canais usam o
-proxy PUB/SUB e as requisições diretas usam o broker DEALER/ROUTER.
-
 ## Parte 5: consistência e replicação
 
 Para a última parte do projeto foi escolhida a estratégia de **réplica ativa**
@@ -17,17 +10,13 @@ O projeto usa dois mecanismos complementares:
 
 - **Push das escritas novas:** operações de `login`, `create_channel` e
   `publish` aceitas por qualquer servidor são publicadas no tópico interno
-  `__replica__` do proxy PUB/SUB. Todos os servidores assinam esse tópico e
+  `replica` do proxy PUB/SUB. Todos os servidores assinam esse tópico e
   aplicam a operação recebida em seu armazenamento local.
 - **Pull de recuperação:** cada servidor expõe um serviço interno na porta
   `5562`. Ao iniciar e durante a manutenção periódica, um servidor pede um
   snapshot ao coordenador atual ou a outro servidor ativo. O snapshot é enviado
   como uma resposta multipart com as operações necessárias para reconstruir o
   estado.
-
-As mensagens de replicação reutilizam o `Envelope` definido em
-`contratos/contrato.proto`, portanto o contrato público dos clientes não foi
-alterado. O tópico `__replica__` é interno aos servidores.
 
 ### Aplicação das réplicas
 
@@ -58,11 +47,3 @@ Essa escolha combina com o projeto porque o broker faz balanceamento entre
 servidores e cada servidor possui seu próprio disco. A réplica ativa permite que
 qualquer servidor continue atendendo clientes, enquanto o push reduz o tempo de
 propagação e o snapshot cobre falhas temporárias ou servidores que entram depois.
-
-### Modo de apresentação
-
-O `docker-compose.yml` usa `SERVER_LOG_MODE=presentation` e
-`CLIENT_LOG_MODE=presentation` por padrão. Nesse modo, o broker, a referência e
-os clientes reduzem os logs de tráfego contínuo para que a demonstração destaque
-os eventos de eleição dos servidores. Para depuração detalhada de mensagens, use
-`SERVER_LOG_MODE=verbose CLIENT_LOG_MODE=verbose docker compose up --build`.
