@@ -16,8 +16,6 @@ public class ServidorApp
     private const int SnapshotPort = 5562;
     private const int RequestTimeoutMs = 2000;
     private const int SnapshotTimeoutMs = 10000;
-    private const int AnnouncementTimeoutMs = 3000;
-    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(5);
     private static readonly string LogMode =
         (Environment.GetEnvironmentVariable("SERVER_LOG_MODE") ?? "presentation").Trim().ToLowerInvariant();
 
@@ -42,7 +40,6 @@ public class ServidorApp
     private readonly RelogioProcesso _relogio = new();
     private readonly Dictionary<string, int> _servidoresAtivos = new();
     private string _coordenadorAtual = "";
-    private long _coordenadorVersao = 0;
     private int _meuRank = 0;
     private bool _electionRunning = false;
     private int _requestsProcessadas = 0;
@@ -55,6 +52,11 @@ public class ServidorApp
         {
             Console.WriteLine(message);
         }
+    }
+
+    private static void LogEleicao(string message)
+    {
+        Console.WriteLine($"[ELEICAO] {message}");
     }
 
     public ServidorApp()
@@ -93,9 +95,10 @@ public class ServidorApp
 
         RegistrarNaReferencia();
         var servidores = ListarServidoresReferencia();
-        DefinirCoordenadorTentativo(servidores);
+        AtualizarServidoresAtivos(servidores);
         IniciarServicosInternos();
         SincronizarReplicas();
+        IniciarEleicaoAsync("inicializacao");
         Console.WriteLine($"[SERVIDOR] Servidor pronto. Rank local={_meuRank} coordenador={CoordenadorAtual()}");
     }
 
@@ -205,15 +208,8 @@ public class ServidorApp
         }
 
         LogVerbose($"[SERVIDOR] Heartbeat enviado com sucesso para {_serverName}");
-        var servidores = ListarServidoresReferencia();
-        AtualizarCoordenadorTentativo();
-        var coordenador = CoordenadorAtual();
-        var encontrado = servidores.Any(servidor => servidor.Nome == coordenador);
-        if (!string.IsNullOrWhiteSpace(coordenador) && !encontrado)
-        {
-            Console.WriteLine($"[SERVIDOR] Coordenador {coordenador} ausente da lista ativa; iniciando eleição");
-            IniciarEleicaoAsync("coordenador ausente da lista ativa");
-        }
+        ListarServidoresReferencia();
+        AvaliarEleicaoAposAtualizacao("heartbeat");
         SincronizarReplicas();
     }
 
@@ -638,23 +634,6 @@ public class ServidorApp
         _ = Task.Run(LoopEleicao);
         _ = Task.Run(LoopSnapshot);
         _ = Task.Run(LoopAnunciosCoordenador);
-        _ = Task.Run(LoopManutencaoReferencia);
-    }
-
-    private void LoopManutencaoReferencia()
-    {
-        while (true)
-        {
-            try
-            {
-                Thread.Sleep(MaintenanceInterval);
-                HeartbeatESincronizar();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[SERVIDOR] Erro na manutenção periódica da referência: {ex.Message}");
-            }
-        }
     }
 
     private void LoopSnapshot()
@@ -901,8 +880,7 @@ public class ServidorApp
                     remetente = "desconhecido";
                 }
 
-                SetCoordenador(coordenador, $"anúncio publicado por {remetente}", true);
-                Console.WriteLine($"[SERVIDOR] Anúncio de coordenador recebido em {topic}: {coordenador}");
+                ProcessarAnuncioCoordenador(coordenador, remetente);
             }
             catch (Exception ex)
             {
@@ -974,68 +952,31 @@ public class ServidorApp
         }
     }
 
-    private long VersaoCoordenador()
-    {
-        lock (_stateLock)
-        {
-            return _coordenadorVersao;
-        }
-    }
-
-    private void SetCoordenador(string nome, string motivo, bool incrementarVersao)
+    private string SetCoordenador(string nome)
     {
         string anterior;
-        long versao;
         lock (_stateLock)
         {
             anterior = _coordenadorAtual;
             _coordenadorAtual = nome;
-            if (incrementarVersao)
-            {
-                _coordenadorVersao += 1;
-            }
-
-            versao = _coordenadorVersao;
         }
-
-        if (anterior == nome)
-        {
-            Console.WriteLine($"[SERVIDOR] Coordenador mantido em {nome} ({motivo}, versao={versao})");
-        }
-        else
-        {
-            Console.WriteLine($"[SERVIDOR] Coordenador atualizado de {anterior} para {nome} ({motivo}, versao={versao})");
-        }
+        return anterior;
     }
 
-    private void DefinirCoordenadorTentativo(List<ServerInfo> servidores)
+    private void AvaliarEleicaoAposAtualizacao(string motivo)
     {
-        if (!string.IsNullOrWhiteSpace(CoordenadorAtual()))
+        var servidores = ServidoresAtivosSnapshot();
+        if (servidores.Count == 0)
         {
             return;
         }
 
-        var candidato = MaiorServidorAtivo();
-        SetCoordenador(candidato, "coordenador tentativo inicial", false);
-    }
-
-    private void AtualizarCoordenadorTentativo()
-    {
-        string atual;
-        lock (_stateLock)
+        var maior = servidores[^1];
+        var coordenador = CoordenadorAtual();
+        var rankCoordenador = string.IsNullOrWhiteSpace(coordenador) ? -1 : RankServidor(coordenador);
+        if (string.IsNullOrWhiteSpace(coordenador) || rankCoordenador < 0 || maior.Rank > rankCoordenador)
         {
-            if (_electionRunning || _coordenadorVersao > 0)
-            {
-                return;
-            }
-
-            atual = _coordenadorAtual;
-        }
-
-        var candidato = MaiorServidorAtivo();
-        if (!string.IsNullOrWhiteSpace(candidato) && candidato != atual)
-        {
-            SetCoordenador(candidato, "coordenador tentativo atualizado pela lista ativa", false);
+            IniciarEleicaoAsync(motivo);
         }
     }
 
@@ -1061,8 +1002,8 @@ public class ServidorApp
 
         try
         {
-            Console.WriteLine($"[SERVIDOR] Iniciando eleição ({motivo})");
-            var versaoInicial = VersaoCoordenador();
+            LogEleicao($"inicio motivo={motivo}");
+            ListarServidoresReferencia();
             var servidores = ServidoresAtivosSnapshot();
             var superiores = servidores
                 .Where(item => item.Rank > _meuRank && item.Nome != _serverName)
@@ -1071,51 +1012,26 @@ public class ServidorApp
 
             if (superiores.Count == 0)
             {
-                if (VersaoCoordenador() > versaoInicial)
-                {
-                    Console.WriteLine("[SERVIDOR] Eleição concluída durante a coleta de respostas");
-                    return;
-                }
-
-                TornarCoordenador("nenhum servidor de maior rank respondeu");
+                TornarCoordenador("sem_servidor_maior");
                 return;
             }
 
-            var respostasOk = new List<ServerInfo>();
+            var recebeuOk = false;
             foreach (var item in superiores)
             {
-                if (ConsultarEleicaoServidor(item.Nome))
+                if (ConsultarEleicaoServidor(item.Nome, true))
                 {
-                    respostasOk.Add(item);
+                    recebeuOk = true;
                 }
             }
 
-            if (VersaoCoordenador() > versaoInicial)
+            if (!recebeuOk)
             {
-                Console.WriteLine("[SERVIDOR] Eleição concluída por anúncio recebido durante a coleta");
+                TornarCoordenador("sem_resposta_de_servidor_maior");
                 return;
             }
 
-            if (respostasOk.Count == 0)
-            {
-                TornarCoordenador("nenhum servidor de maior rank respondeu");
-                return;
-            }
-
-            var deadline = DateTime.UtcNow.AddMilliseconds(AnnouncementTimeoutMs);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (VersaoCoordenador() > versaoInicial)
-                {
-                    Console.WriteLine("[SERVIDOR] Eleição concluída por anúncio de coordenador");
-                    return;
-                }
-
-                Thread.Sleep(100);
-            }
-
-            var candidato = respostasOk.OrderByDescending(item => item.Rank).First();
-            SetCoordenador(candidato.Nome, $"coordenador inferido após timeout de anúncio ({motivo})", true);
+            LogEleicao($"delegada motivo={motivo}");
         }
         catch (Exception ex)
         {
@@ -1132,7 +1048,8 @@ public class ServidorApp
 
     private void TornarCoordenador(string motivo)
     {
-        SetCoordenador(_serverName, motivo, true);
+        SetCoordenador(_serverName);
+        LogEleicao($"eleito coordenador={_serverName} rank={_meuRank} motivo={motivo}");
         AnunciarCoordenador();
     }
 
@@ -1151,12 +1068,62 @@ public class ServidorApp
         try
         {
             _announceSocket.SendMoreFrame(TopicoCoordenador).SendFrame(channelMsg.ToByteArray());
-            Console.WriteLine($"[SERVIDOR] Anunciado coordenador em servers: {_serverName}");
+            LogEleicao($"anuncio publicado coordenador={_serverName} rank={_meuRank}");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[SERVIDOR] Falha ao anunciar coordenador: {ex.Message}");
         }
+    }
+
+    private void ProcessarAnuncioCoordenador(string coordenador, string remetente)
+    {
+        ListarServidoresReferencia();
+        var rankAnunciado = RankServidor(coordenador);
+        if (coordenador == _serverName)
+        {
+            rankAnunciado = _meuRank;
+        }
+
+        if (rankAnunciado < 0)
+        {
+            LogEleicao($"anuncio ignorado coordenador={coordenador} rank=desconhecido motivo=servidor_desconhecido");
+            return;
+        }
+
+        var atual = CoordenadorAtual();
+        var rankAtual = string.IsNullOrWhiteSpace(atual) ? -1 : RankServidor(atual);
+        var aceitar = false;
+        var motivo = "sem_coordenador";
+        if (string.IsNullOrWhiteSpace(atual) || atual == coordenador)
+        {
+            aceitar = true;
+            motivo = string.IsNullOrWhiteSpace(atual) ? "sem_coordenador" : "mesmo_coordenador";
+        }
+        else if (rankAtual < 0)
+        {
+            aceitar = true;
+            motivo = "coordenador_atual_desconhecido";
+        }
+        else if (rankAnunciado >= rankAtual)
+        {
+            aceitar = true;
+            motivo = "rank_maior_ou_igual";
+        }
+        else if (atual != _serverName && !ConsultarEleicaoServidor(atual, false))
+        {
+            aceitar = true;
+            motivo = "coordenador_atual_indisponivel";
+        }
+
+        if (aceitar)
+        {
+            SetCoordenador(coordenador);
+            LogEleicao($"anuncio aceito coordenador={coordenador} rank={rankAnunciado} origem={remetente} motivo={motivo}");
+            return;
+        }
+
+        LogEleicao($"anuncio ignorado coordenador={coordenador} rank={rankAnunciado} motivo=rank_menor_que_atual atual={atual}");
     }
 
     private static long TimestampToNs(global::Google.Protobuf.WellKnownTypes.Timestamp timestamp)
@@ -1189,7 +1156,7 @@ public class ServidorApp
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SERVIDOR] Falha ao comunicar com {nomeServidor}:{porta} - {ex.Message}");
+            LogVerbose($"[SERVIDOR] Falha ao comunicar com {nomeServidor}:{porta} - {ex.Message}");
             return null;
         }
     }
@@ -1212,20 +1179,20 @@ public class ServidorApp
         var reply = EnviarParaServidor(nomeServidor, ClockPort, env, RequestTimeoutMs);
         if (reply is null)
         {
-            Console.WriteLine($"[SERVIDOR] Sem resposta de relógio de {nomeServidor}");
+            LogVerbose($"[SERVIDOR] Sem resposta de relógio de {nomeServidor}");
             return null;
         }
 
         if (reply.Envelope.ConteudoCase != Envelope.ConteudoOneofCase.HeartbeatRes)
         {
-            Console.WriteLine($"[SERVIDOR] Resposta inesperada de relógio de {nomeServidor}: {reply.Envelope.ConteudoCase}");
+            LogVerbose($"[SERVIDOR] Resposta inesperada de relógio de {nomeServidor}: {reply.Envelope.ConteudoCase}");
             return null;
         }
 
         var resposta = reply.Envelope.HeartbeatRes;
         if (resposta.Status != Status.Sucesso)
         {
-            Console.WriteLine($"[SERVIDOR] Servidor {nomeServidor} rejeitou pedido de relógio: {resposta.ErroMsg}");
+            LogVerbose($"[SERVIDOR] Servidor {nomeServidor} rejeitou pedido de relógio: {resposta.ErroMsg}");
             return null;
         }
 
@@ -1233,7 +1200,7 @@ public class ServidorApp
         return reply;
     }
 
-    private bool ConsultarEleicaoServidor(string nomeServidor)
+    private bool ConsultarEleicaoServidor(string nomeServidor, bool registrarLogs)
     {
         var cab = Mensageria.NovoCabecalho(_origem, _relogio);
         var req = new RegisterServerRequest
@@ -1247,28 +1214,43 @@ public class ServidorApp
             RegisterServerReq = req
         };
 
-        LogVerbose($"[SERVIDOR] Enviando pedido de eleição para {nomeServidor} {Mensageria.CabecalhoTexto(cab)}");
+        if (registrarLogs)
+        {
+            LogEleicao($"req destino={nomeServidor}");
+        }
         var reply = EnviarParaServidor(nomeServidor, ElectionPort, env, RequestTimeoutMs);
         if (reply is null)
         {
-            Console.WriteLine($"[SERVIDOR] Sem resposta de eleição de {nomeServidor}");
+            if (registrarLogs)
+            {
+                LogEleicao($"sem_resposta destino={nomeServidor}");
+            }
             return false;
         }
 
         if (reply.Envelope.ConteudoCase != Envelope.ConteudoOneofCase.RegisterServerRes)
         {
-            Console.WriteLine($"[SERVIDOR] Resposta inesperada de eleição de {nomeServidor}: {reply.Envelope.ConteudoCase}");
+            if (registrarLogs)
+            {
+                LogEleicao($"resposta_invalida destino={nomeServidor}");
+            }
             return false;
         }
 
         var resposta = reply.Envelope.RegisterServerRes;
         if (resposta.Status != Status.Sucesso)
         {
-            Console.WriteLine($"[SERVIDOR] Servidor {nomeServidor} rejeitou eleição: {resposta.ErroMsg}");
+            if (registrarLogs)
+            {
+                LogEleicao($"rejeitada destino={nomeServidor} motivo={resposta.ErroMsg}");
+            }
             return false;
         }
 
-        Console.WriteLine($"[SERVIDOR] Servidor {nomeServidor} respondeu OK à eleição (rank={resposta.Rank})");
+        if (registrarLogs)
+        {
+            LogEleicao($"ok origem={nomeServidor} rank={resposta.Rank}");
+        }
         return true;
     }
 
@@ -1344,9 +1326,8 @@ public class ServidorApp
         var coordenador = CoordenadorAtual();
         if (string.IsNullOrWhiteSpace(coordenador))
         {
-            Console.WriteLine("[SERVIDOR] Coordenador desconhecido; iniciando eleição");
-            ExecutarEleicao("coordenador desconhecido");
-            coordenador = CoordenadorAtual();
+            IniciarEleicaoAsync("coordenador_desconhecido");
+            return;
         }
 
         if (IsCoordenador())
@@ -1358,14 +1339,8 @@ public class ServidorApp
         var coordenadorAtivo = ServidoresAtivosSnapshot().Any(servidor => servidor.Nome == coordenador);
         if (!string.IsNullOrWhiteSpace(coordenador) && !coordenadorAtivo)
         {
-            Console.WriteLine($"[SERVIDOR] Coordenador {coordenador} ausente da lista ativa; iniciando eleição");
-            ExecutarEleicao("coordenador ausente da lista ativa");
-            coordenador = CoordenadorAtual();
-            if (IsCoordenador())
-            {
-                SincronizarComoCoordenador();
-                return;
-            }
+            IniciarEleicaoAsync("coordenador_ausente_da_lista");
+            return;
         }
 
         if (!string.IsNullOrWhiteSpace(coordenador) && SincronizarComoSeguidor(coordenador))
@@ -1373,19 +1348,7 @@ public class ServidorApp
             return;
         }
 
-        Console.WriteLine($"[SERVIDOR] Falha ao sincronizar com coordenador {coordenador}; iniciando eleição");
-        ExecutarEleicao("falha ao sincronizar com coordenador");
-        coordenador = CoordenadorAtual();
-        if (IsCoordenador())
-        {
-            SincronizarComoCoordenador();
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(coordenador) && !SincronizarComoSeguidor(coordenador))
-        {
-            Console.WriteLine($"[SERVIDOR] Ainda não foi possível sincronizar com {coordenador} após a eleição");
-        }
+        IniciarEleicaoAsync($"falha_sincronizar_com_{coordenador}");
     }
 
     private HeartbeatResponse ProcessarPedidoRelogio(HeartbeatRequest req)
@@ -1432,8 +1395,12 @@ public class ServidorApp
         {
             resposta.Status = Status.Sucesso;
             resposta.Rank = _meuRank;
-            Console.WriteLine($"[SERVIDOR] Respondendo eleição OK para {solicitante} (solicitante rank={rankSolicitante}, meu rank={_meuRank})");
-            if (!IsCoordenador())
+            LogEleicao($"ok enviado destino={solicitante} rank={_meuRank} solicitante_rank={rankSolicitante}");
+            if (IsCoordenador())
+            {
+                AnunciarCoordenador();
+            }
+            else
             {
                 IniciarEleicaoAsync($"pedido de eleição recebido de {solicitante}");
             }
@@ -1443,7 +1410,7 @@ public class ServidorApp
         resposta.Status = Status.Erro;
         resposta.ErroMsg = "rank inferior";
         resposta.Rank = _meuRank;
-        Console.WriteLine($"[SERVIDOR] Pedido de eleição de {solicitante} rejeitado (solicitante rank={rankSolicitante}, meu rank={_meuRank})");
+        LogEleicao($"pedido ignorado origem={solicitante} motivo=rank_inferior solicitante_rank={rankSolicitante} meu_rank={_meuRank}");
         return resposta;
     }
 

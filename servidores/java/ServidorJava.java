@@ -30,8 +30,6 @@ public class ServidorJava {
   private static final int SNAPSHOT_PORT = 5562;
   private static final int REQUEST_TIMEOUT_MS = 2000;
   private static final int SNAPSHOT_TIMEOUT_MS = 10000;
-  private static final int ANNOUNCEMENT_TIMEOUT_MS = 3000;
-  private static final int MAINTENANCE_INTERVAL_MS = 5000;
   private static final String LOG_MODE = getEnv("SERVER_LOG_MODE", "presentation").trim().toLowerCase();
 
   private final ZMQ.Context context;
@@ -54,7 +52,6 @@ public class ServidorJava {
 
   private int requestsProcessadas = 0;
   private String coordenadorAtual = "";
-  private long coordenadorVersao = 0L;
   private int meuRank = 0;
   private boolean electionRunning = false;
 
@@ -68,6 +65,10 @@ public class ServidorJava {
     if (isVerbose()) {
       System.out.println(message);
     }
+  }
+
+  private static void logEleicao(String message) {
+    System.out.println("[ELEICAO] " + message);
   }
 
   public ServidorJava(
@@ -106,9 +107,10 @@ public class ServidorJava {
     initStorage();
     registrarNaReferencia();
     List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
-    definirCoordenadorTentativo(servidores);
+    atualizarServidoresAtivos(servidores);
     iniciarServicosInternos();
     sincronizarReplicas();
+    iniciarEleicaoAsync("inicializacao");
     System.out.println("[SERVIDOR] Servidor pronto. Rank local=" + meuRank + " coordenador=" + coordenadorAtual());
   }
 
@@ -224,20 +226,8 @@ public class ServidorJava {
       return;
     }
     logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para " + serverName);
-    List<Contrato.ServerInfo> servidores = listarServidoresReferencia();
-    atualizarCoordenadorTentativo();
-    String coordenador = coordenadorAtual();
-    boolean encontrado = false;
-    for (Contrato.ServerInfo servidor : servidores) {
-      if (servidor.getNome().equals(coordenador)) {
-        encontrado = true;
-        break;
-      }
-    }
-    if (!coordenador.isEmpty() && !encontrado) {
-      System.out.println("[SERVIDOR] Coordenador " + coordenador + " ausente da lista ativa; iniciando eleição");
-      iniciarEleicaoAsync("coordenador ausente da lista ativa");
-    }
+    listarServidoresReferencia();
+    avaliarEleicaoAposAtualizacao("heartbeat");
     sincronizarReplicas();
   }
 
@@ -745,21 +735,6 @@ public class ServidorJava {
     Thread announcementThread = new Thread(this::loopAnunciosCoordenador, "servidor-java-announcements");
     announcementThread.setDaemon(true);
     announcementThread.start();
-
-    Thread maintenanceThread = new Thread(this::loopManutencaoReferencia, "servidor-java-maintenance");
-    maintenanceThread.setDaemon(true);
-    maintenanceThread.start();
-  }
-
-  private void loopManutencaoReferencia() {
-    while (true) {
-      try {
-        Thread.sleep(MAINTENANCE_INTERVAL_MS);
-        heartbeatESincronizar();
-      } catch (Exception e) {
-        System.out.println("[SERVIDOR] Erro na manutenção periódica da referência: " + e.getMessage());
-      }
-    }
   }
 
   private void loopSnapshot() {
@@ -1000,8 +975,7 @@ public class ServidorJava {
         if (remetente.isEmpty()) {
           remetente = "desconhecido";
         }
-        setCoordenador(coordenador, "anúncio publicado por " + remetente, true);
-        System.out.println("[SERVIDOR] Anúncio de coordenador recebido em " + topic + ": " + coordenador);
+        processarAnuncioCoordenador(coordenador, remetente);
       } catch (Exception e) {
         System.out.println("[SERVIDOR] Erro ao ler anúncios de coordenador: " + e.getMessage());
       }
@@ -1065,51 +1039,25 @@ public class ServidorJava {
     }
   }
 
-  private long versaoCoordenador() {
-    synchronized (stateLock) {
-      return coordenadorVersao;
-    }
-  }
-
-  private void setCoordenador(String nome, String motivo, boolean incrementarVersao) {
+  private String setCoordenador(String nome) {
     String anterior;
-    long versao;
     synchronized (stateLock) {
       anterior = coordenadorAtual;
       coordenadorAtual = nome;
-      if (incrementarVersao) {
-        coordenadorVersao += 1;
-      }
-      versao = coordenadorVersao;
     }
-
-    if (anterior.equals(nome)) {
-      System.out.println("[SERVIDOR] Coordenador mantido em " + nome + " (" + motivo + ", versao=" + versao + ")");
-    } else {
-      System.out.println("[SERVIDOR] Coordenador atualizado de " + anterior + " para " + nome + " (" + motivo + ", versao=" + versao + ")");
-    }
+    return anterior;
   }
 
-  private void definirCoordenadorTentativo(List<Contrato.ServerInfo> servidores) {
-    if (!coordenadorAtual().isEmpty()) {
+  private void avaliarEleicaoAposAtualizacao(String motivo) {
+    List<Contrato.ServerInfo> servidores = servidoresAtivosSnapshot();
+    if (servidores.isEmpty()) {
       return;
     }
-    String candidato = maiorServidorAtivo();
-    setCoordenador(candidato, "coordenador tentativo inicial", false);
-  }
-
-  private void atualizarCoordenadorTentativo() {
-    String atual;
-    synchronized (stateLock) {
-      if (electionRunning || coordenadorVersao > 0) {
-        return;
-      }
-      atual = coordenadorAtual;
-    }
-
-    String candidato = maiorServidorAtivo();
-    if (!candidato.isEmpty() && !candidato.equals(atual)) {
-      setCoordenador(candidato, "coordenador tentativo atualizado pela lista ativa", false);
+    Contrato.ServerInfo maior = servidores.get(servidores.size() - 1);
+    String coordenador = coordenadorAtual();
+    int rankCoordenador = coordenador.isEmpty() ? -1 : rankServidor(coordenador);
+    if (coordenador.isEmpty() || rankCoordenador < 0 || maior.getRank() > rankCoordenador) {
+      iniciarEleicaoAsync(motivo);
     }
   }
 
@@ -1133,8 +1081,8 @@ public class ServidorJava {
     }
 
     try {
-      System.out.println("[SERVIDOR] Iniciando eleição (" + motivo + ")");
-      long versaoInicial = versaoCoordenador();
+      logEleicao("inicio motivo=" + motivo);
+      listarServidoresReferencia();
       List<Contrato.ServerInfo> servidores = servidoresAtivosSnapshot();
       List<Contrato.ServerInfo> superiores = new ArrayList<>();
       for (Contrato.ServerInfo item : servidores) {
@@ -1145,51 +1093,23 @@ public class ServidorJava {
 
       superiores.sort((a, b) -> Integer.compare((int) b.getRank(), (int) a.getRank()));
       if (superiores.isEmpty()) {
-        if (versaoCoordenador() > versaoInicial) {
-          System.out.println("[SERVIDOR] Eleição concluída durante a coleta de respostas");
-          return;
-        }
-        tornarCoordenador("nenhum servidor de maior rank respondeu");
+        tornarCoordenador("sem_servidor_maior");
         return;
       }
 
-      List<Contrato.ServerInfo> respostasOk = new ArrayList<>();
+      boolean recebeuOk = false;
       for (Contrato.ServerInfo item : superiores) {
-        if (consultarEleicaoServidor(item.getNome())) {
-          respostasOk.add(item);
+        if (consultarEleicaoServidor(item.getNome(), true)) {
+          recebeuOk = true;
         }
       }
 
-      if (versaoCoordenador() > versaoInicial) {
-        System.out.println("[SERVIDOR] Eleição concluída por anúncio recebido durante a coleta");
+      if (!recebeuOk) {
+        tornarCoordenador("sem_resposta_de_servidor_maior");
         return;
       }
 
-      if (respostasOk.isEmpty()) {
-        tornarCoordenador("nenhum servidor de maior rank respondeu");
-        return;
-      }
-
-      long deadline = System.currentTimeMillis() + ANNOUNCEMENT_TIMEOUT_MS;
-      while (System.currentTimeMillis() < deadline) {
-        if (versaoCoordenador() > versaoInicial) {
-          System.out.println("[SERVIDOR] Eleição concluída por anúncio de coordenador");
-          return;
-        }
-        Thread.sleep(100);
-      }
-
-      Contrato.ServerInfo candidato = respostasOk.get(0);
-      for (Contrato.ServerInfo item : respostasOk) {
-        if (item.getRank() > candidato.getRank()) {
-          candidato = item;
-        }
-      }
-      setCoordenador(
-          candidato.getNome(),
-          "coordenador inferido após timeout de anúncio (" + motivo + ")",
-          true
-      );
+      logEleicao("delegada motivo=" + motivo);
     } catch (Exception e) {
       System.out.println("[SERVIDOR] Erro durante eleição: " + e.getMessage());
     } finally {
@@ -1200,7 +1120,8 @@ public class ServidorJava {
   }
 
   private void tornarCoordenador(String motivo) {
-    setCoordenador(serverName, motivo, true);
+    setCoordenador(serverName);
+    logEleicao("eleito coordenador=" + serverName + " rank=" + meuRank + " motivo=" + motivo);
     anunciarCoordenador();
   }
 
@@ -1217,10 +1138,59 @@ public class ServidorJava {
     try {
       announceSocket.sendMore(TOPICO_COORDENADOR.getBytes(ZMQ.CHARSET));
       announceSocket.send(channelMessage.toByteArray(), 0);
-      System.out.println("[SERVIDOR] Anunciado coordenador em servers: " + serverName);
+      logEleicao("anuncio publicado coordenador=" + serverName + " rank=" + meuRank);
     } catch (Exception e) {
       System.out.println("[SERVIDOR] Falha ao anunciar coordenador: " + e.getMessage());
     }
+  }
+
+  private void processarAnuncioCoordenador(String coordenador, String remetente) throws Exception {
+    listarServidoresReferencia();
+    int rankAnunciado = rankServidor(coordenador);
+    if (coordenador.equals(serverName)) {
+      rankAnunciado = meuRank;
+    }
+    if (rankAnunciado < 0) {
+      logEleicao("anuncio ignorado coordenador=" + coordenador + " rank=desconhecido motivo=servidor_desconhecido");
+      return;
+    }
+
+    String atual = coordenadorAtual();
+    int rankAtual = atual.isEmpty() ? -1 : rankServidor(atual);
+    boolean aceitar = false;
+    String motivo = "sem_coordenador";
+    if (atual.isEmpty() || atual.equals(coordenador)) {
+      aceitar = true;
+      if (atual.equals(coordenador)) {
+        motivo = "mesmo_coordenador";
+      }
+    } else if (rankAtual < 0) {
+      aceitar = true;
+      motivo = "coordenador_atual_desconhecido";
+    } else if (rankAnunciado >= rankAtual) {
+      aceitar = true;
+      motivo = "rank_maior_ou_igual";
+    } else if (!atual.equals(serverName) && !consultarEleicaoServidor(atual, false)) {
+      aceitar = true;
+      motivo = "coordenador_atual_indisponivel";
+    }
+
+    if (aceitar) {
+      setCoordenador(coordenador);
+      logEleicao(
+          "anuncio aceito coordenador=" + coordenador
+              + " rank=" + rankAnunciado
+              + " origem=" + remetente
+              + " motivo=" + motivo
+      );
+      return;
+    }
+
+    logEleicao(
+        "anuncio ignorado coordenador=" + coordenador
+            + " rank=" + rankAnunciado
+            + " motivo=rank_menor_que_atual atual=" + atual
+    );
   }
 
   private long timestampToNs(com.google.protobuf.Timestamp timestamp) {
@@ -1246,7 +1216,7 @@ public class ServidorJava {
       relogio.onReceive(resp.getCabecalho().getRelogioLogico());
       return new PeerReply(resp, envioNs, recebimentoNs);
     } catch (Exception e) {
-      System.out.println("[SERVIDOR] Falha ao comunicar com " + nomeServidor + ":" + porta + " - " + e.getMessage());
+      logVerbose("[SERVIDOR] Falha ao comunicar com " + nomeServidor + ":" + porta + " - " + e.getMessage());
       return null;
     } finally {
       sock.close();
@@ -1266,23 +1236,23 @@ public class ServidorJava {
     logVerbose("[SERVIDOR] Enviando heartbeat_req para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
     PeerReply reply = enviarParaServidor(nomeServidor, CLOCK_PORT, env, REQUEST_TIMEOUT_MS);
     if (reply == null) {
-      System.out.println("[SERVIDOR] Sem resposta de relógio de " + nomeServidor);
+      logVerbose("[SERVIDOR] Sem resposta de relógio de " + nomeServidor);
       return null;
     }
     if (reply.envelope.getConteudoCase() != Contrato.Envelope.ConteudoCase.HEARTBEAT_RES) {
-      System.out.println("[SERVIDOR] Resposta inesperada de relógio de " + nomeServidor + ": " + reply.envelope.getConteudoCase());
+      logVerbose("[SERVIDOR] Resposta inesperada de relógio de " + nomeServidor + ": " + reply.envelope.getConteudoCase());
       return null;
     }
     Contrato.HeartbeatResponse resposta = reply.envelope.getHeartbeatRes();
     if (resposta.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      System.out.println("[SERVIDOR] Servidor " + nomeServidor + " rejeitou pedido de relógio: " + resposta.getErroMsg());
+      logVerbose("[SERVIDOR] Servidor " + nomeServidor + " rejeitou pedido de relógio: " + resposta.getErroMsg());
       return null;
     }
     logVerbose("[SERVIDOR] Recebido heartbeat_res de " + nomeServidor + " " + Mensageria.cabecalhoTexto(reply.envelope.getCabecalho()));
     return reply;
   }
 
-  private boolean consultarEleicaoServidor(String nomeServidor) {
+  private boolean consultarEleicaoServidor(String nomeServidor, boolean registrarLogs) {
     Contrato.Cabecalho cab = Mensageria.novoCabecalho(origem, relogio);
     Contrato.RegisterServerRequest req = Contrato.RegisterServerRequest.newBuilder()
         .setCabecalho(cab)
@@ -1292,22 +1262,32 @@ public class ServidorJava {
         .setCabecalho(cab)
         .setRegisterServerReq(req)
         .build();
-    logVerbose("[SERVIDOR] Enviando pedido de eleição para " + nomeServidor + " " + Mensageria.cabecalhoTexto(cab));
+    if (registrarLogs) {
+      logEleicao("req destino=" + nomeServidor);
+    }
     PeerReply reply = enviarParaServidor(nomeServidor, ELECTION_PORT, env, REQUEST_TIMEOUT_MS);
     if (reply == null) {
-      System.out.println("[SERVIDOR] Sem resposta de eleição de " + nomeServidor);
+      if (registrarLogs) {
+        logEleicao("sem_resposta destino=" + nomeServidor);
+      }
       return false;
     }
     if (reply.envelope.getConteudoCase() != Contrato.Envelope.ConteudoCase.REGISTER_SERVER_RES) {
-      System.out.println("[SERVIDOR] Resposta inesperada de eleição de " + nomeServidor + ": " + reply.envelope.getConteudoCase());
+      if (registrarLogs) {
+        logEleicao("resposta_invalida destino=" + nomeServidor);
+      }
       return false;
     }
     Contrato.RegisterServerResponse resposta = reply.envelope.getRegisterServerRes();
     if (resposta.getStatus() != Contrato.Status.STATUS_SUCESSO) {
-      System.out.println("[SERVIDOR] Servidor " + nomeServidor + " rejeitou eleição: " + resposta.getErroMsg());
+      if (registrarLogs) {
+        logEleicao("rejeitada destino=" + nomeServidor + " motivo=" + resposta.getErroMsg());
+      }
       return false;
     }
-    System.out.println("[SERVIDOR] Servidor " + nomeServidor + " respondeu OK à eleição (rank=" + resposta.getRank() + ")");
+    if (registrarLogs) {
+      logEleicao("ok origem=" + nomeServidor + " rank=" + resposta.getRank());
+    }
     return true;
   }
 
@@ -1377,9 +1357,8 @@ public class ServidorJava {
   private void sincronizarRelogioFisico() {
     String coordenador = coordenadorAtual();
     if (coordenador.isBlank()) {
-      System.out.println("[SERVIDOR] Coordenador desconhecido; iniciando eleição");
-      executarEleicao("coordenador desconhecido");
-      coordenador = coordenadorAtual();
+      iniciarEleicaoAsync("coordenador_desconhecido");
+      return;
     }
 
     if (isCoordenador()) {
@@ -1396,29 +1375,15 @@ public class ServidorJava {
     }
 
     if (!coordenador.isBlank() && !coordenadorAtivo) {
-      System.out.println("[SERVIDOR] Coordenador " + coordenador + " ausente da lista ativa; iniciando eleição");
-      executarEleicao("coordenador ausente da lista ativa");
-      coordenador = coordenadorAtual();
-      if (isCoordenador()) {
-        sincronizarComoCoordenador();
-        return;
-      }
+      iniciarEleicaoAsync("coordenador_ausente_da_lista");
+      return;
     }
 
     if (!coordenador.isBlank() && sincronizarComoSeguidor(coordenador)) {
       return;
     }
 
-    System.out.println("[SERVIDOR] Falha ao sincronizar com coordenador " + coordenador + "; iniciando eleição");
-    executarEleicao("falha ao sincronizar com coordenador");
-    coordenador = coordenadorAtual();
-    if (isCoordenador()) {
-      sincronizarComoCoordenador();
-      return;
-    }
-    if (!coordenador.isBlank() && !sincronizarComoSeguidor(coordenador)) {
-      System.out.println("[SERVIDOR] Ainda não foi possível sincronizar com " + coordenador + " após a eleição");
-    }
+    iniciarEleicaoAsync("falha_sincronizar_com_" + coordenador);
   }
 
   private Contrato.HeartbeatResponse processarPedidoRelogio(Contrato.HeartbeatRequest req) {
@@ -1458,8 +1423,10 @@ public class ServidorJava {
     if (meuRank > rankSolicitante) {
       resposta.setStatus(Contrato.Status.STATUS_SUCESSO);
       resposta.setRank(meuRank);
-      System.out.println("[SERVIDOR] Respondendo eleição OK para " + solicitante + " (solicitante rank=" + rankSolicitante + ", meu rank=" + meuRank + ")");
-      if (!isCoordenador()) {
+      logEleicao("ok enviado destino=" + solicitante + " rank=" + meuRank + " solicitante_rank=" + rankSolicitante);
+      if (isCoordenador()) {
+        anunciarCoordenador();
+      } else {
         iniciarEleicaoAsync("pedido de eleição recebido de " + solicitante);
       }
       return resposta.build();
@@ -1468,7 +1435,7 @@ public class ServidorJava {
     resposta.setStatus(Contrato.Status.STATUS_ERRO);
     resposta.setErroMsg("rank inferior");
     resposta.setRank(meuRank);
-    System.out.println("[SERVIDOR] Pedido de eleição de " + solicitante + " rejeitado (solicitante rank=" + rankSolicitante + ", meu rank=" + meuRank + ")");
+    logEleicao("pedido ignorado origem=" + solicitante + " motivo=rank_inferior solicitante_rank=" + rankSolicitante + " meu_rank=" + meuRank);
     return resposta.build();
   }
 

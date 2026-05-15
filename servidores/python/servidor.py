@@ -37,8 +37,6 @@ ELECTION_PORT = 5561
 SNAPSHOT_PORT = 5562
 REQUEST_TIMEOUT_MS = 2000
 SNAPSHOT_TIMEOUT_MS = 10000
-ANNOUNCEMENT_TIMEOUT_SECONDS = 3.0
-MAINTENANCE_INTERVAL_SECONDS = float(os.getenv("SERVER_MAINTENANCE_INTERVAL_SECONDS", "5"))
 TOPICO_COORDENADOR = "servers"
 TOPICO_REPLICA = "__replica__"
 LOG_MODE = os.getenv("SERVER_LOG_MODE", "presentation").strip().lower() or "presentation"
@@ -51,6 +49,10 @@ PUBLICACOES_PATH = DATA_DIR / "publicacoes.jsonl"
 def _log_verbose(message: str, *args: object) -> None:
     if LOG_MODE == "verbose":
         logging.info(message, *args)
+
+
+def _log_eleicao(message: str, *args: object) -> None:
+    logging.info("[ELEICAO] " + message, *args)
 
 
 class Servidor:
@@ -78,7 +80,6 @@ class Servidor:
         self._storage_lock = threading.RLock()
         self._reference_lock = threading.Lock()
         self._coordinator_name = ""
-        self._coordinator_version = 0
         self._active_servers: dict[str, int] = {}
         self._my_rank = 0
         self._election_running = False
@@ -90,9 +91,9 @@ class Servidor:
         self._registrar_na_referencia()
         servidores = self._listar_servidores_referencia()
         self._atualizar_servidores_ativos(servidores)
-        self._definir_coordenador_tentativo(servidores)
         self._iniciar_servicos_internos()
         self._sincronizar_replicas()
+        self._iniciar_eleicao_async("inicializacao")
         logging.info(
             "Servidor pronto. Rank local=%s coordenador=%s",
             self._my_rank,
@@ -475,13 +476,7 @@ class Servidor:
 
         _log_verbose("Heartbeat enviado com sucesso para %s", SERVER_NAME)
         servidores = self._listar_servidores_referencia()
-        self._atualizar_coordenador_tentativo()
-        if self._coordenador_atual() and self._coordenador_atual() not in {item.nome for item in servidores}:
-            logging.warning(
-                "Coordenador %s ausente da lista ativa; iniciando eleição",
-                self._coordenador_atual(),
-            )
-            self._iniciar_eleicao_async("coordenador ausente da lista ativa")
+        self._avaliar_eleicao_apos_atualizacao("heartbeat")
         self._sincronizar_replicas()
 
     def loop(self) -> None:
@@ -621,15 +616,6 @@ class Servidor:
         threading.Thread(target=self._loop_eleicao, daemon=True).start()
         threading.Thread(target=self._loop_snapshot, daemon=True).start()
         threading.Thread(target=self._loop_anuncios_coord, daemon=True).start()
-        threading.Thread(target=self._loop_manutencao_referencia, daemon=True).start()
-
-    def _loop_manutencao_referencia(self) -> None:
-        while True:
-            time.sleep(MAINTENANCE_INTERVAL_SECONDS)
-            try:
-                self._heartbeat_e_sincronizar()
-            except Exception as exc:
-                logging.warning("Erro na manutenção periódica da referência: %s", exc)
 
     def _loop_snapshot(self) -> None:
         socket = self.context.socket(zmq.REP)
@@ -806,15 +792,7 @@ class Servidor:
                 if remetente == SERVER_NAME and coordenador == SERVER_NAME:
                     continue
 
-                self._set_coordenador(
-                    coordenador,
-                    f"anúncio publicado por {remetente or 'desconhecido'}",
-                    incrementar_versao=True,
-                )
-                logging.info(
-                    "Anúncio de coordenador recebido em servers: %s",
-                    coordenador,
-                )
+                self._processar_anuncio_coordenador(coordenador, remetente)
             except Exception as exc:
                 logging.warning("Erro ao receber anúncio de coordenador: %s", exc)
                 time.sleep(0.2)
@@ -857,49 +835,22 @@ class Servidor:
         with self._lock:
             return self._coordinator_name
 
-    def _versao_coordenador(self) -> int:
-        with self._lock:
-            return self._coordinator_version
-
-    def _set_coordenador(
-        self,
-        nome: str,
-        motivo: str,
-        *,
-        incrementar_versao: bool,
-    ) -> None:
+    def _set_coordenador(self, nome: str) -> str:
         with self._lock:
             antigo = self._coordinator_name
             self._coordinator_name = nome
-            if incrementar_versao:
-                self._coordinator_version += 1
-            versao = self._coordinator_version
+            return antigo
 
-        if antigo == nome:
-            logging.info("Coordenador mantido em %s (%s, versao=%s)", nome, motivo, versao)
-        else:
-            logging.info("Coordenador atualizado de %s para %s (%s, versao=%s)", antigo or "(vazio)", nome, motivo, versao)
-
-    def _definir_coordenador_tentativo(self, servidores: list[contrato_pb2.ServerInfo]) -> None:
-        if self._coordenador_atual():
+    def _avaliar_eleicao_apos_atualizacao(self, motivo: str) -> None:
+        servidores = self._servidores_ativos_snapshot()
+        if not servidores:
             return
 
-        candidato = self._maior_servidor_ativo()
-        self._set_coordenador(candidato, "coordenador tentativo inicial", incrementar_versao=False)
-
-    def _atualizar_coordenador_tentativo(self) -> None:
-        with self._lock:
-            if self._election_running or self._coordinator_version > 0:
-                return
-            candidato = self._maior_servidor_ativo()
-            atual = self._coordinator_name
-
-        if candidato and candidato != atual:
-            self._set_coordenador(
-                candidato,
-                "coordenador tentativo atualizado pela lista ativa",
-                incrementar_versao=False,
-            )
+        maior = max(servidores, key=lambda item: item.rank)
+        coordenador = self._coordenador_atual()
+        rank_coordenador = self._rank_servidor(coordenador) if coordenador else None
+        if not coordenador or rank_coordenador is None or maior.rank > rank_coordenador:
+            self._iniciar_eleicao_async(motivo)
 
     def _is_coordenador(self) -> bool:
         return self._coordenador_atual() == SERVER_NAME
@@ -921,8 +872,9 @@ class Servidor:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _executar_eleicao(self, motivo: str) -> None:
-        logging.info("Iniciando eleição (%s)", motivo)
-        versao_inicial = self._versao_coordenador()
+        _log_eleicao("inicio motivo=%s", motivo)
+        servidores = self._listar_servidores_referencia()
+        self._atualizar_servidores_ativos(servidores)
         servidores = self._servidores_ativos_snapshot()
         superiores = [
             item
@@ -931,41 +883,28 @@ class Servidor:
         ]
 
         if not superiores:
-            self._tornar_coordenador("nenhum servidor de maior rank respondeu")
+            self._tornar_coordenador("sem_servidor_maior")
             return
 
-        respostas_ok: list[contrato_pb2.ServerInfo] = []
+        recebeu_ok = False
         for item in sorted(superiores, key=lambda server: server.rank, reverse=True):
             if self._consultar_eleicao_servidor(item.nome):
-                respostas_ok.append(item)
+                recebeu_ok = True
 
-        if not respostas_ok:
-            if self._versao_coordenador() > versao_inicial:
-                logging.info("Eleição concluída durante a coleta de respostas")
-                return
-            self._tornar_coordenador("nenhum servidor de maior rank respondeu")
+        if not recebeu_ok:
+            self._tornar_coordenador("sem_resposta_de_servidor_maior")
             return
 
-        if self._versao_coordenador() > versao_inicial:
-            logging.info("Eleição concluída por anúncio recebido durante a coleta")
-            return
-
-        deadline = time.monotonic() + ANNOUNCEMENT_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            if self._versao_coordenador() > versao_inicial:
-                logging.info("Eleição concluída por anúncio de coordenador")
-                return
-            time.sleep(0.1)
-
-        candidato = max(respostas_ok, key=lambda item: item.rank)
-        self._set_coordenador(
-            candidato.nome,
-            f"coordenador inferido após timeout de anúncio ({motivo})",
-            incrementar_versao=True,
-        )
+        _log_eleicao("delegada motivo=%s", motivo)
 
     def _tornar_coordenador(self, motivo: str) -> None:
-        self._set_coordenador(SERVER_NAME, motivo, incrementar_versao=True)
+        self._set_coordenador(SERVER_NAME)
+        _log_eleicao(
+            "eleito coordenador=%s rank=%s motivo=%s",
+            SERVER_NAME,
+            self._my_rank,
+            motivo,
+        )
         self._anunciar_coordenador()
 
     def _anunciar_coordenador(self) -> None:
@@ -980,9 +919,56 @@ class Servidor:
             self.announce_socket.send_multipart(
                 [TOPICO_COORDENADOR.encode("utf-8"), msg.SerializeToString()]
             )
-            logging.info("Anunciado coordenador em servers: %s", SERVER_NAME)
+            _log_eleicao("anuncio publicado coordenador=%s rank=%s", SERVER_NAME, self._my_rank)
         except Exception as exc:
             logging.warning("Falha ao anunciar coordenador: %s", exc)
+
+    def _processar_anuncio_coordenador(self, coordenador: str, remetente: str) -> None:
+        self._listar_servidores_referencia()
+        rank_anunciado = self._rank_servidor(coordenador)
+        if coordenador == SERVER_NAME:
+            rank_anunciado = self._my_rank
+        if rank_anunciado is None:
+            _log_eleicao(
+                "anuncio ignorado coordenador=%s rank=desconhecido motivo=servidor_desconhecido",
+                coordenador,
+            )
+            return
+
+        atual = self._coordenador_atual()
+        rank_atual = self._rank_servidor(atual) if atual else None
+        aceitar = False
+        motivo = "sem_coordenador"
+        if not atual or atual == coordenador:
+            aceitar = True
+            motivo = "sem_coordenador" if not atual else "mesmo_coordenador"
+        elif rank_atual is None:
+            aceitar = True
+            motivo = "coordenador_atual_desconhecido"
+        elif rank_anunciado >= rank_atual:
+            aceitar = True
+            motivo = "rank_maior_ou_igual"
+        elif atual != SERVER_NAME and not self._consultar_eleicao_servidor(atual, registrar_logs=False):
+            aceitar = True
+            motivo = "coordenador_atual_indisponivel"
+
+        if aceitar:
+            self._set_coordenador(coordenador)
+            _log_eleicao(
+                "anuncio aceito coordenador=%s rank=%s origem=%s motivo=%s",
+                coordenador,
+                rank_anunciado,
+                remetente or "desconhecido",
+                motivo,
+            )
+            return
+
+        _log_eleicao(
+            "anuncio ignorado coordenador=%s rank=%s motivo=rank_menor_que_atual atual=%s",
+            coordenador,
+            rank_anunciado,
+            atual,
+        )
 
     def _enviar_para_servidor(
         self,
@@ -1007,7 +993,7 @@ class Servidor:
         except zmq.Again:
             return None, envio_ns, time.time_ns()
         except Exception as exc:
-            logging.warning("Falha ao comunicar com %s:%s: %s", nome_servidor, porta, exc)
+            _log_verbose("Falha ao comunicar com %s:%s: %s", nome_servidor, porta, exc)
             return None, envio_ns, time.time_ns()
         finally:
             socket.close(0)
@@ -1029,13 +1015,13 @@ class Servidor:
         )
         resp_env, _, _ = self._enviar_para_servidor(nome_servidor, CLOCK_PORT, env)
         if resp_env is None:
-            logging.warning("Sem resposta de relógio de %s", nome_servidor)
+            _log_verbose("Sem resposta de relógio de %s", nome_servidor)
             return None
         if resp_env.WhichOneof("conteudo") != "heartbeat_res":
-            logging.warning("Resposta inesperada de relógio de %s", nome_servidor)
+            _log_verbose("Resposta inesperada de relógio de %s", nome_servidor)
             return None
         if resp_env.heartbeat_res.status != contrato_pb2.STATUS_SUCESSO:
-            logging.warning(
+            _log_verbose(
                 "Servidor %s rejeitou pedido de relógio: %s",
                 nome_servidor,
                 resp_env.heartbeat_res.erro_msg,
@@ -1048,7 +1034,7 @@ class Servidor:
         )
         return resp_env
 
-    def _consultar_eleicao_servidor(self, nome_servidor: str) -> bool:
+    def _consultar_eleicao_servidor(self, nome_servidor: str, registrar_logs: bool = True) -> bool:
         env = contrato_pb2.Envelope()
         env.cabecalho.CopyFrom(novo_cabecalho(self.origem, self.relogio))
         req = contrato_pb2.RegisterServerRequest()
@@ -1056,33 +1042,30 @@ class Servidor:
         req.nome_servidor = SERVER_NAME
         env.register_server_req.CopyFrom(req)
 
-        _log_verbose(
-            "Enviando pedido de eleição para %s %s",
-            nome_servidor,
-            cabecalho_texto(env.cabecalho),
-        )
+        if registrar_logs:
+            _log_eleicao("req destino=%s", nome_servidor)
         resp_env, _, _ = self._enviar_para_servidor(
             nome_servidor, ELECTION_PORT, env, timeout_ms=REQUEST_TIMEOUT_MS
         )
         if resp_env is None:
-            logging.warning("Sem resposta de eleição de %s", nome_servidor)
+            if registrar_logs:
+                _log_eleicao("sem_resposta destino=%s", nome_servidor)
             return False
         if resp_env.WhichOneof("conteudo") != "register_server_res":
-            logging.warning("Resposta inesperada de eleição de %s", nome_servidor)
+            if registrar_logs:
+                _log_eleicao("resposta_invalida destino=%s", nome_servidor)
             return False
         if resp_env.register_server_res.status != contrato_pb2.STATUS_SUCESSO:
-            logging.warning(
-                "Servidor %s rejeitou eleição: %s",
-                nome_servidor,
-                resp_env.register_server_res.erro_msg,
-            )
+            if registrar_logs:
+                _log_eleicao("rejeitada destino=%s motivo=%s", nome_servidor, resp_env.register_server_res.erro_msg)
             return False
 
-        logging.info(
-            "Servidor %s respondeu OK à eleição (rank=%s)",
+        if registrar_logs:
+            _log_eleicao(
+            "ok origem=%s rank=%s",
             nome_servidor,
             resp_env.register_server_res.rank,
-        )
+            )
         return True
 
     def _sincronizar_como_seguidor(self, coordenador: str) -> bool:
@@ -1149,9 +1132,8 @@ class Servidor:
     def _sincronizar_relogio_fisico(self) -> None:
         coordenador = self._coordenador_atual()
         if not coordenador:
-            logging.warning("Coordenador desconhecido; iniciando eleição")
-            self._executar_eleicao("coordenador desconhecido")
-            coordenador = self._coordenador_atual()
+            self._iniciar_eleicao_async("coordenador_desconhecido")
+            return
 
         if self._is_coordenador():
             self._sincronizar_como_coordenador()
@@ -1159,27 +1141,13 @@ class Servidor:
 
         ativos = {item.nome for item in self._servidores_ativos_snapshot()}
         if coordenador and coordenador not in ativos:
-            logging.warning(
-                "Coordenador %s ausente da lista ativa; iniciando eleição",
-                coordenador,
-            )
-            self._executar_eleicao("coordenador ausente da lista ativa")
-            coordenador = self._coordenador_atual()
-            if self._is_coordenador():
-                self._sincronizar_como_coordenador()
-                return
+            self._iniciar_eleicao_async("coordenador_ausente_da_lista")
+            return
 
         if coordenador and self._sincronizar_como_seguidor(coordenador):
             return
 
-        logging.warning("Falha ao sincronizar com coordenador %s; iniciando eleição", coordenador or "(desconhecido)")
-        self._executar_eleicao("falha ao sincronizar com coordenador")
-        coordenador = self._coordenador_atual()
-        if self._is_coordenador():
-            self._sincronizar_como_coordenador()
-        elif coordenador:
-            if not self._sincronizar_como_seguidor(coordenador):
-                logging.warning("Ainda não foi possível sincronizar com %s após a eleição", coordenador)
+        self._iniciar_eleicao_async(f"falha_sincronizar_com_{coordenador or 'desconhecido'}")
 
     def _processar_pedido_relogio(
         self, req: contrato_pb2.HeartbeatRequest
@@ -1219,24 +1187,26 @@ class Servidor:
         if self._my_rank > rank_solicitante:
             resposta.status = contrato_pb2.STATUS_SUCESSO
             resposta.rank = self._my_rank
-            logging.info(
-                "Respondendo eleição OK para %s (solicitante rank=%s, meu rank=%s)",
+            _log_eleicao(
+                "ok enviado destino=%s rank=%s solicitante_rank=%s",
                 solicitante,
-                rank_solicitante,
                 self._my_rank,
+                rank_solicitante,
             )
-            if not self._is_coordenador():
+            if self._is_coordenador():
+                self._anunciar_coordenador()
+            else:
                 self._iniciar_eleicao_async(f"pedido de eleição recebido de {solicitante}")
             return resposta
 
         resposta.status = contrato_pb2.STATUS_ERRO
         resposta.erro_msg = "rank inferior"
         resposta.rank = self._my_rank
-        logging.info(
-            "Pedido de eleição de %s rejeitado (solicitante rank=%s, meu rank=%s)",
-            solicitante,
-            rank_solicitante,
+        _log_eleicao(
+            "anuncio ignorado coordenador=%s rank=%s motivo=rank_inferior solicitante=%s",
+            SERVER_NAME,
             self._my_rank,
+            solicitante,
         )
         return resposta
 
