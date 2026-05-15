@@ -9,6 +9,8 @@ import shared.mensageria.Mensageria;
 import shared.mensageria.RelogioProcesso;
 
 public class ClienteJava {
+  private static final String LOG_MODE = getEnv("CLIENT_LOG_MODE", "presentation").trim().toLowerCase();
+
   private final ZMQ.Socket socket;
   private final ZMQ.Socket subSocket;
 
@@ -38,12 +40,22 @@ public class ClienteJava {
     this.socket.connect(this.orqEndpoint);
     this.subSocket = context.socket(ZMQ.SUB);
     this.subSocket.connect(this.proxySubEndpoint);
-    System.out.println("[CLIENTE] Conectado ao orquestrador em " + this.orqEndpoint);
-    System.out.println("[CLIENTE] Conectado ao proxy sub em " + this.proxySubEndpoint);
+    logVerbose("[CLIENTE] Conectado ao orquestrador em " + this.orqEndpoint);
+    logVerbose("[CLIENTE] Conectado ao proxy sub em " + this.proxySubEndpoint);
+  }
+
+  private static boolean isVerbose() {
+    return "verbose".equals(LOG_MODE);
+  }
+
+  private static void logVerbose(String message) {
+    if (isVerbose()) {
+      System.out.println(message);
+    }
   }
 
   private Contrato.Envelope enviarEAguardar(Contrato.Envelope env) throws Exception {
-    System.out.println(
+    logVerbose(
         "[CLIENTE] Enviando " + env.getConteudoCase() + " " + Mensageria.cabecalhoTexto(env.getCabecalho())
     );
     socket.send(Mensageria.envelopeBytes(env), 0);
@@ -53,7 +65,7 @@ public class ClienteJava {
     }
     Contrato.Envelope resp = Mensageria.envelopeFromBytes(reply);
     relogio.onReceive(resp.getCabecalho().getRelogioLogico());
-    System.out.println(
+    logVerbose(
         "[CLIENTE] Recebido " + resp.getConteudoCase() + " " + Mensageria.cabecalhoTexto(resp.getCabecalho())
     );
     return resp;
@@ -75,17 +87,17 @@ public class ClienteJava {
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.LOGIN_RES) {
-      System.err.println("[CLIENTE] Resposta inesperada ao login: " + respEnv.getConteudoCase());
+      logVerbose("[CLIENTE] Resposta inesperada ao login: " + respEnv.getConteudoCase());
       return false;
     }
 
     Contrato.LoginResponse res = respEnv.getLoginRes();
     if (res.getStatus() == Contrato.Status.STATUS_SUCESSO) {
-      System.out.println("[CLIENTE] Login bem-sucedido para '" + nomeUsuario + "'");
+      logVerbose("[CLIENTE] Login bem-sucedido para '" + nomeUsuario + "'");
       return true;
     }
 
-    System.out.println("[CLIENTE] Falha no login: " + res.getErroMsg());
+    logVerbose("[CLIENTE] Falha no login: " + res.getErroMsg());
     return false;
   }
 
@@ -105,7 +117,7 @@ public class ClienteJava {
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.CREATE_CHANNEL_RES) {
-      System.err.println(
+      logVerbose(
           "[CLIENTE] Resposta inesperada a criacao de canal: " + respEnv.getConteudoCase()
       );
       return;
@@ -113,9 +125,9 @@ public class ClienteJava {
 
     Contrato.CreateChannelResponse res = respEnv.getCreateChannelRes();
     if (res.getStatus() == Contrato.Status.STATUS_SUCESSO) {
-      System.out.println("[CLIENTE] Canal '" + nomeCanal + "' criado com sucesso");
+      logVerbose("[CLIENTE] Canal '" + nomeCanal + "' criado com sucesso");
     } else {
-      System.out.println("[CLIENTE] Falha ao criar canal '" + nomeCanal + "': " + res.getErroMsg());
+      logVerbose("[CLIENTE] Falha ao criar canal '" + nomeCanal + "': " + res.getErroMsg());
     }
   }
 
@@ -134,7 +146,7 @@ public class ClienteJava {
     Contrato.Envelope respEnv = enviarEAguardar(env);
 
     if (respEnv.getConteudoCase() != Contrato.Envelope.ConteudoCase.LIST_CHANNELS_RES) {
-      System.err.println(
+      logVerbose(
           "[CLIENTE] Resposta inesperada a listagem de canais: " + respEnv.getConteudoCase()
       );
       return new ArrayList<>();
@@ -143,9 +155,9 @@ public class ClienteJava {
     Contrato.ListChannelsResponse res = respEnv.getListChannelsRes();
     List<String> canais = new ArrayList<>(res.getCanaisList());
     if (canais.isEmpty()) {
-      System.out.println("[CLIENTE] Canais existentes: (nenhum)");
+      logVerbose("[CLIENTE] Canais existentes: (nenhum)");
     } else {
-      System.out.println("[CLIENTE] Canais existentes: " + String.join(", ", canais));
+      logVerbose("[CLIENTE] Canais existentes: " + String.join(", ", canais));
     }
     return canais;
   }
@@ -175,7 +187,7 @@ public class ClienteJava {
     }
     subSocket.subscribe(canal.getBytes(ZMQ.CHARSET));
     subscribedChannels.add(canal);
-    System.out.println("[CLIENTE] Inscrito no canal '" + canal + "'");
+    logVerbose("[CLIENTE] Inscrito no canal '" + canal + "'");
   }
 
   private void iniciarReceptor() {
@@ -190,7 +202,7 @@ public class ClienteJava {
           String topic = new String(topicBytes, ZMQ.CHARSET);
           Contrato.ChannelMessage msg = Contrato.ChannelMessage.parseFrom(payload);
           relogio.onReceive(msg.getRelogioLogico());
-          System.out.println(
+          logVerbose(
               "[CLIENTE] [CANAL=" + topic + "] msg='" + msg.getMensagem() + "' remetente="
                   + msg.getRemetente()
                   + " envio=" + Mensageria.timestampTexto(msg.getTimestampEnvio())
@@ -198,7 +210,7 @@ public class ClienteJava {
                   + " relogio=" + msg.getRelogioLogico()
           );
         } catch (Exception e) {
-          System.err.println("[CLIENTE] Erro ao receber pub/sub: " + e.getMessage());
+          logVerbose("[CLIENTE] Erro ao receber pub/sub: " + e.getMessage());
         }
       }
     });

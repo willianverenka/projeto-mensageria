@@ -27,6 +27,12 @@ ORQ_ENDPOINT = os.getenv("ORQ_ENDPOINT", "tcp://orquestrador:5555")
 PROXY_SUB_ENDPOINT = os.getenv("PROXY_SUB_ENDPOINT", "tcp://proxy:5558")
 NOME_USUARIO = os.getenv("CLIENTE_NOME", "cliente_python")
 NOME_CANAL = os.getenv("CLIENTE_CANAL", "canal_padrao")
+LOG_MODE = os.getenv("CLIENT_LOG_MODE", "presentation").strip().lower() or "presentation"
+
+
+def _log_verbose(message: str, *args: object) -> None:
+    if LOG_MODE == "verbose":
+        logging.info(message, *args)
 
 
 def _agora_texto() -> str:
@@ -44,17 +50,17 @@ class Cliente:
         self.subscribed_channels: set[str] = set()
         self.relogio = RelogioProcesso()
         self.origem = origem_label("cliente")
-        logging.info("Conectado ao orquestrador em %s", ORQ_ENDPOINT)
-        logging.info("Conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
+        _log_verbose("Conectado ao orquestrador em %s", ORQ_ENDPOINT)
+        _log_verbose("Conectado ao proxy sub em %s", PROXY_SUB_ENDPOINT)
 
     def _enviar_e_aguardar(self, env: contrato_pb2.Envelope) -> contrato_pb2.Envelope:
         tipo = env.WhichOneof("conteudo") or "desconhecido"
-        logging.info("Enviando %s %s", tipo, cabecalho_texto(env.cabecalho))
+        _log_verbose("Enviando %s %s", tipo, cabecalho_texto(env.cabecalho))
         self.socket.send(envelope_bytes(env))
         data = self.socket.recv()
         resp_env = envelope_from_bytes(data)
         self.relogio.on_receive(resp_env.cabecalho.relogio_logico)
-        logging.info(
+        _log_verbose(
             "Recebido %s %s",
             resp_env.WhichOneof("conteudo") or "desconhecido",
             cabecalho_texto(resp_env.cabecalho),
@@ -72,15 +78,15 @@ class Cliente:
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "login_res":
-            logging.error("Resposta inesperada ao login: %s", conteudo)
+            _log_verbose("Resposta inesperada ao login: %s", conteudo)
             return False
 
         res = resp_env.login_res
         if res.status == contrato_pb2.STATUS_SUCESSO:
-            logging.info("Login bem-sucedido para '%s'", nome_usuario)
+            _log_verbose("Login bem-sucedido para '%s'", nome_usuario)
             return True
 
-        logging.warning("Falha no login: %s", res.erro_msg)
+        _log_verbose("Falha no login: %s", res.erro_msg)
         return False
 
     def criar_canal(self, nome_canal: str) -> None:
@@ -94,14 +100,14 @@ class Cliente:
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "create_channel_res":
-            logging.error("Resposta inesperada a criação de canal: %s", conteudo)
+            _log_verbose("Resposta inesperada a criação de canal: %s", conteudo)
             return
 
         res = resp_env.create_channel_res
         if res.status == contrato_pb2.STATUS_SUCESSO:
-            logging.info("Canal '%s' criado com sucesso", nome_canal)
+            _log_verbose("Canal '%s' criado com sucesso", nome_canal)
         else:
-            logging.warning("Falha ao criar canal '%s': %s", nome_canal, res.erro_msg)
+            _log_verbose("Falha ao criar canal '%s': %s", nome_canal, res.erro_msg)
 
     def listar_canais(self) -> List[str]:
         env = contrato_pb2.Envelope()
@@ -113,12 +119,12 @@ class Cliente:
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "list_channels_res":
-            logging.error("Resposta inesperada a listagem de canais: %s", conteudo)
+            _log_verbose("Resposta inesperada a listagem de canais: %s", conteudo)
             return []
 
         res = resp_env.list_channels_res
         canais = list(res.canais)
-        logging.info("Canais existentes: %s", ", ".join(canais) if canais else "(nenhum)")
+        _log_verbose("Canais existentes: %s", ", ".join(canais) if canais else "(nenhum)")
         return canais
 
     def publicar(self, canal: str, mensagem: str) -> bool:
@@ -133,12 +139,12 @@ class Cliente:
         resp_env = self._enviar_e_aguardar(env)
         conteudo = resp_env.WhichOneof("conteudo")
         if conteudo != "publish_res":
-            logging.error("Resposta inesperada ao publicar: %s", conteudo)
+            _log_verbose("Resposta inesperada ao publicar: %s", conteudo)
             return False
         res = resp_env.publish_res
         if res.status == contrato_pb2.STATUS_SUCESSO:
             return True
-        logging.warning("Falha ao publicar em '%s': %s", canal, res.erro_msg)
+        _log_verbose("Falha ao publicar em '%s': %s", canal, res.erro_msg)
         return False
 
     def inscrever(self, canal: str) -> None:
@@ -146,7 +152,7 @@ class Cliente:
             return
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, canal.encode("utf-8"))
         self.subscribed_channels.add(canal)
-        logging.info("Inscrito no canal '%s'", canal)
+        _log_verbose("Inscrito no canal '%s'", canal)
 
     def iniciar_receptor(self) -> None:
         def _loop() -> None:
@@ -156,7 +162,7 @@ class Cliente:
                     msg = contrato_pb2.ChannelMessage()
                     msg.ParseFromString(payload)
                     self.relogio.on_receive(msg.relogio_logico)
-                    logging.info(
+                    _log_verbose(
                         "[CANAL=%s] msg='%s' remetente=%s envio=%s recebimento=%s relogio=%s",
                         topic.decode("utf-8"),
                         msg.mensagem,
@@ -166,7 +172,7 @@ class Cliente:
                         msg.relogio_logico,
                     )
                 except Exception as exc:
-                    logging.warning("Erro no receptor de pub/sub: %s", exc)
+                    _log_verbose("Erro no receptor de pub/sub: %s", exc)
                     time.sleep(0.2)
 
         thread = threading.Thread(target=_loop, daemon=True)

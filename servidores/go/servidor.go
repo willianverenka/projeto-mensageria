@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,18 +21,45 @@ import (
 )
 
 const (
-	orqEndpointDefault = "tcp://orquestrador:5556"
-	proxyPubEndpoint   = "tcp://proxy:5557"
-	proxySubEndpoint   = "tcp://proxy:5558"
-	referenceEndpoint  = "tcp://referencia:5559"
-	dataDirDefault     = "/data"
-	clockPort          = 5560
-	electionPort       = 5561
-	requestTimeout     = 2 * time.Second
-	announcementDelay  = 3 * time.Second
-	startupDelay       = 200 * time.Millisecond
-	topicoCoordenador  = "servers"
+	orqEndpointDefault        = "tcp://orquestrador:5556"
+	proxyPubEndpoint          = "tcp://proxy:5557"
+	proxySubEndpoint          = "tcp://proxy:5558"
+	referenceEndpoint         = "tcp://referencia:5559"
+	dataDirDefault            = "/data"
+	clockPort                 = 5560
+	electionPort              = 5561
+	snapshotPort              = 5562
+	requestTimeout            = 2 * time.Second
+	snapshotTimeout           = 10 * time.Second
+	topicoCoordenador         = "servers"
+	topicoReplica             = "__replica__"
+	erroServidorNaoRegistrado = "servidor não registrado"
 )
+
+var (
+	logMode                 = strings.ToLower(strings.TrimSpace(getEnv("SERVER_LOG_MODE", "presentation")))
+	timeoutTesteCoordenador = time.Duration(getEnvInt("TIMEOUT_TESTE_COORDENADOR", 500)) * time.Millisecond
+)
+
+func init() {
+	if logMode == "" {
+		logMode = "presentation"
+	}
+}
+
+func logVerbose(format string, args ...any) {
+	if logMode == "verbose" {
+		log.Printf(format, args...)
+	}
+}
+
+func logEleicao(format string, args ...any) {
+	log.Printf("[ELEICAO] "+format, args...)
+}
+
+func logEleicaoVerbose(format string, args ...any) {
+	logVerbose("[ELEICAO] "+format, args...)
+}
 
 func main() {
 	orqEndpoint := getEnv("ORQ_ENDPOINT_SERVIDOR", orqEndpointDefault)
@@ -49,14 +77,14 @@ func main() {
 	if err := sock.Connect(orqEndpoint); err != nil {
 		log.Fatalf("Conectar ao orquestrador: %v", err)
 	}
-	log.Printf("[SERVIDOR] Conectado ao orquestrador em %s", orqEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao orquestrador em %s", orqEndpoint)
 
 	server := &Servidor{
 		sock:              sock,
 		pubSock:           mustNewPubSocket(pubEndpoint),
 		announceSock:      mustNewPubSocket(pubEndpoint),
 		refSock:           mustNewReqSocket(refEndpoint),
-		subSock:           mustNewSubSocket(proxySubEndpoint, topicoCoordenador),
+		subSock:           mustNewSubSocket(proxySubEndpoint, topicoCoordenador, topicoReplica),
 		dataDir:           dataDir,
 		pubEndpoint:       pubEndpoint,
 		referenceEndpoint: refEndpoint,
@@ -64,22 +92,22 @@ func main() {
 		clock:             &mensageria.RelogioProcesso{},
 		origem:            mensageria.OrigemLabel(mensageria.RoleServidor),
 		activeServers:     map[string]int32{},
+		knownRanks:        map[string]int32{},
 	}
 	defer server.pubSock.Close()
 	defer server.announceSock.Close()
 	defer server.refSock.Close()
 	defer server.subSock.Close()
-	log.Printf("[SERVIDOR] Conectado ao proxy pub em %s", pubEndpoint)
-	log.Printf("[SERVIDOR] Conectado ao proxy sub em %s", proxySubEndpoint)
-	log.Printf("[SERVIDOR] Conectado à referência em %s", refEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao proxy pub em %s", pubEndpoint)
+	logVerbose("[SERVIDOR] Conectado ao proxy sub em %s", proxySubEndpoint)
+	logVerbose("[SERVIDOR] Conectado à referência em %s", refEndpoint)
 	server.initStorage()
 	server.registrarNaReferencia()
 	servidores := server.listarServidoresReferencia()
 	server.atualizarServidoresAtivos(servidores)
-	server.definirCoordenadorTentativo(servidores)
 	server.iniciarServicosInternos()
-	time.Sleep(startupDelay)
-	server.executarEleicao("startup")
+	server.sincronizarReplicas()
+	server.iniciarEleicaoAsync("inicializacao")
 	log.Printf("[SERVIDOR] Servidor pronto. Rank local=%d coordenador=%s", server.myRank, server.coordenadorAtual())
 	server.loop()
 }
@@ -98,9 +126,11 @@ type Servidor struct {
 	announceSock      *zmq4.Socket
 	subSock           *zmq4.Socket
 	stateMu           sync.RWMutex
+	storageMu         sync.Mutex
+	refMu             sync.Mutex
 	coordenador       string
-	coordenadorVersao int64
 	activeServers     map[string]int32
+	knownRanks        map[string]int32
 	myRank            int32
 	electionRunning   bool
 }
@@ -150,7 +180,7 @@ func mustNewReqSocketWithTimeout(endpoint string, timeout time.Duration) *zmq4.S
 	return sock
 }
 
-func mustNewSubSocket(endpoint, topic string) *zmq4.Socket {
+func mustNewSubSocket(endpoint string, topics ...string) *zmq4.Socket {
 	sock, err := zmq4.NewSocket(zmq4.SUB)
 	if err != nil {
 		log.Fatalf("Novo socket SUB: %v", err)
@@ -158,8 +188,10 @@ func mustNewSubSocket(endpoint, topic string) *zmq4.Socket {
 	if err := sock.Connect(endpoint); err != nil {
 		log.Fatalf("Conectar SUB ao proxy: %v", err)
 	}
-	if err := sock.SetSubscribe(topic); err != nil {
-		log.Fatalf("Inscrever no tópico %s: %v", topic, err)
+	for _, topic := range topics {
+		if err := sock.SetSubscribe(topic); err != nil {
+			log.Fatalf("Inscrever no tópico %s: %v", topic, err)
+		}
 	}
 	return sock
 }
@@ -169,6 +201,18 @@ func getEnv(name, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+func getEnvInt(name string, defaultVal int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultVal
+	}
+	return n
 }
 
 func conteudoNome(env *protos.Envelope) string {
@@ -222,6 +266,12 @@ func (s *Servidor) initStorage() {
 }
 
 func (s *Servidor) registrarNaReferencia() {
+	if err := s.registrarNaReferenciaSeguro(); err != nil {
+		log.Fatalf("[SERVIDOR] %v", err)
+	}
+}
+
+func (s *Servidor) registrarNaReferenciaSeguro() error {
 	cab := mensageria.NovoCabecalho(s.origem, s.clock)
 	req := &protos.RegisterServerRequest{Cabecalho: cab, NomeServidor: s.serverName}
 	env := &protos.Envelope{
@@ -230,18 +280,32 @@ func (s *Servidor) registrarNaReferencia() {
 	}
 	resp, err := s.enviarParaReferencia(env, true)
 	if err != nil {
-		log.Fatalf("[SERVIDOR] Erro ao registrar na referência: %v", err)
+		return fmt.Errorf("erro ao registrar na referência: %w", err)
 	}
 	res, ok := resp.GetConteudo().(*protos.Envelope_RegisterServerRes)
 	if !ok {
-		log.Fatalf("[SERVIDOR] Resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
+		return fmt.Errorf("resposta inesperada ao registrar na referência: %T", resp.GetConteudo())
 	}
 	if res.RegisterServerRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Fatalf("[SERVIDOR] Falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
+		return fmt.Errorf("falha ao registrar na referência: %s", res.RegisterServerRes.GetErroMsg())
 	}
+	rankAnterior := s.myRank
 	s.myRank = res.RegisterServerRes.GetRank()
+	if rankAnterior > 0 && rankAnterior != s.myRank {
+		logVerbose("[SERVIDOR] Rank local atualizado de %d para %d após registro na referência", rankAnterior, s.myRank)
+	}
 	s.atualizarServidoresAtivos([]*protos.ServerInfo{{Nome: s.serverName, Rank: s.myRank}})
-	log.Printf("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
+	logVerbose("[SERVIDOR] Servidor %s registrado na referência com rank=%d", s.serverName, res.RegisterServerRes.GetRank())
+	return nil
+}
+
+func (s *Servidor) registrarNovamenteAposHeartbeat() bool {
+	if err := s.registrarNaReferenciaSeguro(); err != nil {
+		logVerbose("[SERVIDOR] Falha ao registrar novamente após heartbeat rejeitado: %v", err)
+		return false
+	}
+	logVerbose("[SERVIDOR] Heartbeat recuperado: servidor registrado novamente rank=%d", s.myRank)
+	return true
 }
 
 func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
@@ -272,7 +336,7 @@ func (s *Servidor) listarServidoresReferencia() []*protos.ServerInfo {
 	if len(partes) == 0 {
 		partes = append(partes, "(nenhum)")
 	}
-	log.Printf("[SERVIDOR] Servidores disponíveis na referência: %s", strings.Join(partes, ", "))
+	logVerbose("[SERVIDOR] Servidores disponíveis na referência: %s", strings.Join(partes, ", "))
 	s.atualizarServidoresAtivos(servidores)
 	return servidores
 }
@@ -286,33 +350,29 @@ func (s *Servidor) heartbeatESincronizar() {
 	}
 	resp, err := s.enviarParaReferencia(env, true)
 	if err != nil {
-		log.Printf("[SERVIDOR] Erro ao enviar heartbeat: %v", err)
+		logVerbose("[SERVIDOR] Erro ao enviar heartbeat: %v", err)
 		return
 	}
 	res, ok := resp.GetConteudo().(*protos.Envelope_HeartbeatRes)
 	if !ok {
-		log.Printf("[SERVIDOR] Resposta inesperada ao heartbeat: %T", resp.GetConteudo())
+		logVerbose("[SERVIDOR] Resposta inesperada ao heartbeat: %T", resp.GetConteudo())
 		return
 	}
 	if res.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
-		return
-	}
-	log.Printf("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
-	servidores := s.listarServidoresReferencia()
-	if coordenador := s.coordenadorAtual(); coordenador != "" {
-		encontrado := false
-		for _, servidor := range servidores {
-			if servidor.GetNome() == coordenador {
-				encontrado = true
-				break
+		if res.HeartbeatRes.GetErroMsg() == erroServidorNaoRegistrado {
+			logVerbose("[SERVIDOR] Heartbeat rejeitado: servidor não registrado; registrando novamente")
+			if !s.registrarNovamenteAposHeartbeat() {
+				return
 			}
+		} else {
+			logVerbose("[SERVIDOR] Heartbeat rejeitado: %s", res.HeartbeatRes.GetErroMsg())
+			return
 		}
-		if !encontrado {
-			log.Printf("[SERVIDOR] Coordenador %s ausente da lista ativa; iniciando eleição", coordenador)
-			s.iniciarEleicaoAsync("coordenador ausente da lista ativa")
-		}
+	} else {
+		logVerbose("[SERVIDOR] Heartbeat enviado com sucesso para %s", s.serverName)
 	}
+	s.listarServidoresReferencia()
+	s.sincronizarReplicas()
 }
 
 func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bool) (*protos.Envelope, error) {
@@ -320,8 +380,10 @@ func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bo
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[SERVIDOR] Enviando %s para referência %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
+	logVerbose("[SERVIDOR] Enviando %s para referência %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 	envioNs := time.Now().UnixNano()
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
 	if _, err := s.refSock.SendBytes(data, 0); err != nil {
 		return nil, err
 	}
@@ -335,13 +397,19 @@ func (s *Servidor) enviarParaReferencia(env *protos.Envelope, atualizarOffset bo
 		return nil, err
 	}
 	s.clock.OnReceive(resp.GetCabecalho().GetRelogioLogico())
-	log.Printf("[SERVIDOR] Recebido %s da referência %s", conteudoNome(resp), mensageria.CabecalhoTexto(resp.GetCabecalho()))
+	logVerbose("[SERVIDOR] Recebido %s da referência %s", conteudoNome(resp), mensageria.CabecalhoTexto(resp.GetCabecalho()))
 	_ = envioNs
 	_ = recebimentoNs
 	return resp, nil
 }
 
 func (s *Servidor) lerCanais() []string {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	return s.lerCanaisSemLock()
+}
+
+func (s *Servidor) lerCanaisSemLock() []string {
 	data, err := os.ReadFile(s.canaisPath())
 	if err != nil {
 		return nil
@@ -350,43 +418,411 @@ func (s *Servidor) lerCanais() []string {
 	if err := json.Unmarshal(data, &canais); err != nil {
 		return nil
 	}
+	canais = normalizarCanais(canais)
 	return canais
 }
 
 func (s *Servidor) salvarCanais(canais []string) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	s.salvarCanaisSemLock(canais)
+}
+
+func (s *Servidor) salvarCanaisSemLock(canais []string) {
+	canais = normalizarCanais(canais)
 	data, _ := json.Marshal(canais)
 	_ = os.WriteFile(s.canaisPath(), data, 0644)
 }
 
-func (s *Servidor) registrarLogin(nomeUsuario, timestampISO string) {
-	line, _ := json.Marshal(map[string]string{"usuario": nomeUsuario, "timestamp": timestampISO})
-	f, err := os.OpenFile(s.loginsPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
+func normalizarCanais(canais []string) []string {
+	seen := map[string]bool{}
+	normalizados := make([]string, 0, len(canais))
+	for _, canal := range canais {
+		canal = strings.TrimSpace(canal)
+		if canal == "" || seen[canal] {
+			continue
+		}
+		seen[canal] = true
+		normalizados = append(normalizados, canal)
 	}
-	defer f.Close()
-	_, _ = f.Write(append(line, '\n'))
+	sort.Strings(normalizados)
+	return normalizados
+}
+
+func (s *Servidor) adicionarCanalIdempotente(nome string) bool {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	canais := s.lerCanaisSemLock()
+	for _, canal := range canais {
+		if canal == nome {
+			return false
+		}
+	}
+	canais = append(canais, nome)
+	s.salvarCanaisSemLock(canais)
+	return true
+}
+
+func (s *Servidor) lerJSONL(path string) []map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(data), "\n")
+	registros := make([]map[string]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item map[string]string
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			continue
+		}
+		registros = append(registros, item)
+	}
+	return registros
+}
+
+func (s *Servidor) salvarJSONL(path string, registros []map[string]string) {
+	var builder strings.Builder
+	for _, registro := range registros {
+		line, err := json.Marshal(registro)
+		if err != nil {
+			continue
+		}
+		builder.Write(line)
+		builder.WriteByte('\n')
+	}
+	_ = os.WriteFile(path, []byte(builder.String()), 0644)
+}
+
+func (s *Servidor) registrarLogin(nomeUsuario, timestampISO string) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	registros := s.lerJSONL(s.loginsPath())
+	for _, item := range registros {
+		if item["usuario"] == nomeUsuario && item["timestamp"] == timestampISO {
+			return
+		}
+	}
+	registros = append(registros, map[string]string{"usuario": nomeUsuario, "timestamp": timestampISO})
+	sort.Slice(registros, func(i, j int) bool {
+		if registros[i]["timestamp"] == registros[j]["timestamp"] {
+			return registros[i]["usuario"] < registros[j]["usuario"]
+		}
+		return registros[i]["timestamp"] < registros[j]["timestamp"]
+	})
+	s.salvarJSONL(s.loginsPath(), registros)
 }
 
 func (s *Servidor) registrarPublicacao(canal, mensagem, remetente, timestampISO string) {
-	line, _ := json.Marshal(
-		map[string]string{
-			"canal":     canal,
-			"mensagem":  mensagem,
-			"remetente": remetente,
-			"timestamp": timestampISO,
-		},
-	)
-	f, err := os.OpenFile(s.publicacoesPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	registros := s.lerJSONL(s.publicacoesPath())
+	for _, item := range registros {
+		if item["canal"] == canal &&
+			item["mensagem"] == mensagem &&
+			item["remetente"] == remetente &&
+			item["timestamp"] == timestampISO {
+			return
+		}
+	}
+	registros = append(registros, map[string]string{
+		"canal":     canal,
+		"mensagem":  mensagem,
+		"remetente": remetente,
+		"timestamp": timestampISO,
+	})
+	sort.Slice(registros, func(i, j int) bool {
+		left := registros[i]
+		right := registros[j]
+		if left["timestamp"] != right["timestamp"] {
+			return left["timestamp"] < right["timestamp"]
+		}
+		if left["canal"] != right["canal"] {
+			return left["canal"] < right["canal"]
+		}
+		if left["remetente"] != right["remetente"] {
+			return left["remetente"] < right["remetente"]
+		}
+		return left["mensagem"] < right["mensagem"]
+	})
+	s.salvarJSONL(s.publicacoesPath(), registros)
+}
+
+func (s *Servidor) replicaOrigem() string {
+	return "replica:" + s.serverName
+}
+
+func timestampTextoParaTimestamp(texto string) *timestamppb.Timestamp {
+	partes := strings.SplitN(texto, ".", 2)
+	if len(partes) != 2 {
+		return timestamppb.New(time.Unix(0, 0).UTC())
+	}
+	var segundos int64
+	var nanos int64
+	_, _ = fmt.Sscanf(partes[0], "%d", &segundos)
+	nanosTexto := partes[1]
+	if len(nanosTexto) > 9 {
+		nanosTexto = nanosTexto[:9]
+	}
+	for len(nanosTexto) < 9 {
+		nanosTexto += "0"
+	}
+	_, _ = fmt.Sscanf(nanosTexto, "%d", &nanos)
+	return timestamppb.New(time.Unix(segundos, nanos).UTC())
+}
+
+func (s *Servidor) novoEnvelopeReplicacao() *protos.Envelope {
+	return &protos.Envelope{Cabecalho: mensageria.NovoCabecalho(s.replicaOrigem(), s.clock)}
+}
+
+func (s *Servidor) publicarReplicacao(env *protos.Envelope) {
+	data, err := proto.Marshal(env)
 	if err != nil {
+		log.Printf("[SERVIDOR] Falha ao serializar réplica: %v", err)
 		return
 	}
-	defer f.Close()
-	_, _ = f.Write(append(line, '\n'))
+	if _, err := s.pubSock.SendMessage([]byte(topicoReplica), data); err != nil {
+		log.Printf("[SERVIDOR] Falha ao publicar réplica: %v", err)
+	}
+}
+
+func (s *Servidor) replicarLogin(req *protos.LoginRequest) {
+	env := s.novoEnvelopeReplicacao()
+	env.Conteudo = &protos.Envelope_LoginReq{LoginReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) replicarCreateChannel(req *protos.CreateChannelRequest) {
+	env := s.novoEnvelopeReplicacao()
+	env.Conteudo = &protos.Envelope_CreateChannelReq{CreateChannelReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) replicarPublicacao(canal, mensagem, remetente string, cabPublicacao *protos.Cabecalho) {
+	env := s.novoEnvelopeReplicacao()
+	cab := proto.Clone(cabPublicacao).(*protos.Cabecalho)
+	cab.LinguagemOrigem = remetente
+	req := &protos.PublishRequest{
+		Cabecalho: cab,
+		Canal:     canal,
+		Mensagem:  mensagem,
+	}
+	env.Conteudo = &protos.Envelope_PublishReq{PublishReq: req}
+	s.publicarReplicacao(env)
+}
+
+func (s *Servidor) operacoesSnapshot() []*protos.Envelope {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	operacoes := []*protos.Envelope{}
+	for _, item := range s.lerJSONL(s.loginsPath()) {
+		nome := strings.TrimSpace(item["usuario"])
+		if nome == "" {
+			continue
+		}
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: "snapshot",
+			TimestampEnvio:  timestampTextoParaTimestamp(item["timestamp"]),
+		}
+		env.Conteudo = &protos.Envelope_LoginReq{
+			LoginReq: &protos.LoginRequest{Cabecalho: cab, NomeUsuario: nome},
+		}
+		operacoes = append(operacoes, env)
+	}
+
+	for _, canal := range s.lerCanaisSemLock() {
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: "snapshot",
+			TimestampEnvio:  timestamppb.New(time.Unix(0, 0).UTC()),
+		}
+		env.Conteudo = &protos.Envelope_CreateChannelReq{
+			CreateChannelReq: &protos.CreateChannelRequest{Cabecalho: cab, NomeCanal: canal},
+		}
+		operacoes = append(operacoes, env)
+	}
+
+	for _, item := range s.lerJSONL(s.publicacoesPath()) {
+		canal := strings.TrimSpace(item["canal"])
+		mensagem := strings.TrimSpace(item["mensagem"])
+		if canal == "" || mensagem == "" {
+			continue
+		}
+		remetente := strings.TrimSpace(item["remetente"])
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		env := s.novoEnvelopeReplicacao()
+		cab := &protos.Cabecalho{
+			LinguagemOrigem: remetente,
+			TimestampEnvio:  timestampTextoParaTimestamp(item["timestamp"]),
+		}
+		env.Conteudo = &protos.Envelope_PublishReq{
+			PublishReq: &protos.PublishRequest{Cabecalho: cab, Canal: canal, Mensagem: mensagem},
+		}
+		operacoes = append(operacoes, env)
+	}
+	return operacoes
+}
+
+func (s *Servidor) aplicarOperacaoReplicada(env *protos.Envelope) {
+	switch c := env.GetConteudo().(type) {
+	case *protos.Envelope_LoginReq:
+		nome := strings.TrimSpace(c.LoginReq.GetNomeUsuario())
+		if nome != "" {
+			s.registrarLogin(nome, mensageria.TimestampTexto(c.LoginReq.GetCabecalho().GetTimestampEnvio()))
+		}
+	case *protos.Envelope_CreateChannelReq:
+		nome := strings.TrimSpace(c.CreateChannelReq.GetNomeCanal())
+		if nome != "" {
+			s.adicionarCanalIdempotente(nome)
+		}
+	case *protos.Envelope_PublishReq:
+		req := c.PublishReq
+		canal := strings.TrimSpace(req.GetCanal())
+		mensagem := strings.TrimSpace(req.GetMensagem())
+		if canal == "" || mensagem == "" {
+			return
+		}
+		s.adicionarCanalIdempotente(canal)
+		remetente := strings.TrimSpace(req.GetCabecalho().GetLinguagemOrigem())
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		s.registrarPublicacao(
+			canal,
+			mensagem,
+			remetente,
+			mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()),
+		)
+	}
+}
+
+func chaveLogin(item map[string]string) string {
+	return item["usuario"] + "\x00" + item["timestamp"]
+}
+
+func chavePublicacao(item map[string]string) string {
+	return item["canal"] + "\x00" + item["mensagem"] + "\x00" + item["remetente"] + "\x00" + item["timestamp"]
+}
+
+func (s *Servidor) aplicarOperacoesReplicadas(operacoes []*protos.Envelope) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	canaisSet := map[string]bool{}
+	for _, canal := range s.lerCanaisSemLock() {
+		canaisSet[canal] = true
+	}
+
+	loginsPorChave := map[string]map[string]string{}
+	for _, item := range s.lerJSONL(s.loginsPath()) {
+		loginsPorChave[chaveLogin(item)] = item
+	}
+
+	publicacoesPorChave := map[string]map[string]string{}
+	for _, item := range s.lerJSONL(s.publicacoesPath()) {
+		publicacoesPorChave[chavePublicacao(item)] = item
+	}
+
+	for _, env := range operacoes {
+		switch c := env.GetConteudo().(type) {
+		case *protos.Envelope_LoginReq:
+			nome := strings.TrimSpace(c.LoginReq.GetNomeUsuario())
+			if nome == "" {
+				continue
+			}
+			item := map[string]string{
+				"usuario":   nome,
+				"timestamp": mensageria.TimestampTexto(c.LoginReq.GetCabecalho().GetTimestampEnvio()),
+			}
+			loginsPorChave[chaveLogin(item)] = item
+		case *protos.Envelope_CreateChannelReq:
+			nome := strings.TrimSpace(c.CreateChannelReq.GetNomeCanal())
+			if nome != "" {
+				canaisSet[nome] = true
+			}
+		case *protos.Envelope_PublishReq:
+			req := c.PublishReq
+			canal := strings.TrimSpace(req.GetCanal())
+			mensagem := strings.TrimSpace(req.GetMensagem())
+			if canal == "" || mensagem == "" {
+				continue
+			}
+			canaisSet[canal] = true
+			remetente := strings.TrimSpace(req.GetCabecalho().GetLinguagemOrigem())
+			if remetente == "" {
+				remetente = "desconhecido"
+			}
+			item := map[string]string{
+				"canal":     canal,
+				"mensagem":  mensagem,
+				"remetente": remetente,
+				"timestamp": mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()),
+			}
+			publicacoesPorChave[chavePublicacao(item)] = item
+		}
+	}
+
+	canais := make([]string, 0, len(canaisSet))
+	for canal := range canaisSet {
+		canais = append(canais, canal)
+	}
+	s.salvarCanaisSemLock(canais)
+
+	logins := make([]map[string]string, 0, len(loginsPorChave))
+	for _, item := range loginsPorChave {
+		logins = append(logins, item)
+	}
+	sort.Slice(logins, func(i, j int) bool {
+		if logins[i]["timestamp"] == logins[j]["timestamp"] {
+			return logins[i]["usuario"] < logins[j]["usuario"]
+		}
+		return logins[i]["timestamp"] < logins[j]["timestamp"]
+	})
+	s.salvarJSONL(s.loginsPath(), logins)
+
+	publicacoes := make([]map[string]string, 0, len(publicacoesPorChave))
+	for _, item := range publicacoesPorChave {
+		publicacoes = append(publicacoes, item)
+	}
+	sort.Slice(publicacoes, func(i, j int) bool {
+		left := publicacoes[i]
+		right := publicacoes[j]
+		if left["timestamp"] != right["timestamp"] {
+			return left["timestamp"] < right["timestamp"]
+		}
+		if left["canal"] != right["canal"] {
+			return left["canal"] < right["canal"]
+		}
+		if left["remetente"] != right["remetente"] {
+			return left["remetente"] < right["remetente"]
+		}
+		return left["mensagem"] < right["mensagem"]
+	})
+	s.salvarJSONL(s.publicacoesPath(), publicacoes)
+}
+
+func (s *Servidor) respostaSnapshotStatus(status protos.Status, erroMsg string) *protos.Envelope {
+	cab := mensageria.NovoCabecalho(s.origem, s.clock)
+	res := &protos.HeartbeatResponse{
+		Cabecalho: cab,
+		Status:    status,
+		ErroMsg:   erroMsg,
+	}
+	return &protos.Envelope{
+		Cabecalho: cab,
+		Conteudo:  &protos.Envelope_HeartbeatRes{HeartbeatRes: res},
+	}
 }
 
 func (s *Servidor) loop() {
-	log.Println("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
+	logVerbose("[SERVIDOR] Servidor iniciado. Aguardando mensagens...")
 	for {
 		data, err := s.sock.RecvBytes(0)
 		if err != nil {
@@ -400,7 +836,7 @@ func (s *Servidor) loop() {
 		}
 
 		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
-		log.Printf("[SERVIDOR] Recebido %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
+		logVerbose("[SERVIDOR] Recebido %s %s", conteudoNome(env), mensageria.CabecalhoTexto(env.GetCabecalho()))
 
 		conteudo := env.GetConteudo()
 		if conteudo == nil {
@@ -439,7 +875,7 @@ func (s *Servidor) loop() {
 			respEnv.Conteudo = &protos.Envelope_PublishRes{PublishRes: r}
 		}
 		respData, _ := proto.Marshal(respEnv)
-		log.Printf("[SERVIDOR] Enviando %s %s", conteudoNome(respEnv), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
+		logVerbose("[SERVIDOR] Enviando %s %s", conteudoNome(respEnv), mensageria.CabecalhoTexto(respEnv.GetCabecalho()))
 		if _, err := s.sock.SendBytes(respData, 0); err != nil {
 			log.Printf("[SERVIDOR] Send: %v", err)
 			continue
@@ -458,7 +894,130 @@ func (s *Servidor) loop() {
 func (s *Servidor) iniciarServicosInternos() {
 	go s.loopRelogio()
 	go s.loopEleicao()
+	go s.loopSnapshot()
 	go s.loopAnunciosCoordenador()
+}
+
+func (s *Servidor) loopSnapshot() {
+	sock := mustBindReplySocket(snapshotPort)
+	defer sock.Close()
+	logVerbose("[SERVIDOR] Serviço de snapshot ouvindo em tcp://*:%d", snapshotPort)
+	for {
+		data, err := sock.RecvBytes(0)
+		if err != nil {
+			log.Printf("[SERVIDOR] Erro no serviço de snapshot: %v", err)
+			continue
+		}
+
+		env, err := mensageria.EnvelopeFromBytes(data)
+		if err != nil {
+			log.Printf("[SERVIDOR] Snapshot request inválido: %v", err)
+			continue
+		}
+		s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+
+		status := s.respostaSnapshotStatus(protos.Status_STATUS_SUCESSO, "")
+		if _, ok := env.GetConteudo().(*protos.Envelope_HeartbeatReq); !ok {
+			status = s.respostaSnapshotStatus(protos.Status_STATUS_ERRO, "tipo não suportado para snapshot")
+		}
+
+		frames := [][]byte{}
+		statusData, _ := proto.Marshal(status)
+		frames = append(frames, statusData)
+		if status.GetHeartbeatRes().GetStatus() == protos.Status_STATUS_SUCESSO {
+			for _, op := range s.operacoesSnapshot() {
+				data, err := proto.Marshal(op)
+				if err == nil {
+					frames = append(frames, data)
+				}
+			}
+		}
+		parts := make([]interface{}, len(frames))
+		for i, frame := range frames {
+			parts[i] = frame
+		}
+		if _, err := sock.SendMessage(parts...); err != nil {
+			log.Printf("[SERVIDOR] Erro ao enviar snapshot: %v", err)
+		}
+	}
+}
+
+func (s *Servidor) sincronizarReplicas() {
+	candidatos := []string{}
+	coordenador := s.coordenadorAtual()
+	if coordenador != "" && coordenador != s.serverName {
+		candidatos = append(candidatos, coordenador)
+	}
+	for _, servidor := range s.servidoresAtivosSnapshot() {
+		nome := servidor.GetNome()
+		if nome == s.serverName || contemString(candidatos, nome) {
+			continue
+		}
+		candidatos = append(candidatos, nome)
+	}
+	for _, nome := range candidatos {
+		s.solicitarSnapshot(nome)
+	}
+}
+
+func contemString(items []string, procurado string) bool {
+	for _, item := range items {
+		if item == procurado {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Servidor) solicitarSnapshot(nomeServidor string) bool {
+	cab := mensageria.NovoCabecalho(s.origem, s.clock)
+	req := &protos.HeartbeatRequest{Cabecalho: cab, NomeServidor: s.serverName}
+	env := &protos.Envelope{
+		Cabecalho: cab,
+		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
+	}
+	data, err := proto.Marshal(env)
+	if err != nil {
+		return false
+	}
+
+	sock := mustNewReqSocketWithTimeout(fmt.Sprintf("tcp://%s:%d", nomeServidor, snapshotPort), snapshotTimeout)
+	defer sock.Close()
+	if _, err := sock.SendBytes(data, 0); err != nil {
+		return false
+	}
+	frames, err := sock.RecvMessageBytes(0)
+	if err != nil || len(frames) == 0 {
+		return false
+	}
+
+	statusEnv, err := mensageria.EnvelopeFromBytes(frames[0])
+	if err != nil {
+		return false
+	}
+	s.clock.OnReceive(statusEnv.GetCabecalho().GetRelogioLogico())
+	status, ok := statusEnv.GetConteudo().(*protos.Envelope_HeartbeatRes)
+	if !ok || status.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
+		return false
+	}
+
+	operacoes := []*protos.Envelope{}
+	for _, frame := range frames[1:] {
+		op, err := mensageria.EnvelopeFromBytes(frame)
+		if err != nil {
+			continue
+		}
+		s.clock.OnReceive(op.GetCabecalho().GetRelogioLogico())
+		operacoes = append(operacoes, op)
+	}
+	if len(operacoes) > 0 {
+		s.aplicarOperacoesReplicadas(operacoes)
+	}
+	aplicadas := len(operacoes)
+	if aplicadas > 0 {
+		logVerbose("[SERVIDOR] Snapshot aplicado de %s com %d operações", nomeServidor, aplicadas)
+	}
+	return true
 }
 
 func mustBindReplySocket(port int) *zmq4.Socket {
@@ -475,7 +1034,7 @@ func mustBindReplySocket(port int) *zmq4.Socket {
 func (s *Servidor) loopRelogio() {
 	sock := mustBindReplySocket(clockPort)
 	defer sock.Close()
-	log.Printf("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:%d", clockPort)
+	logVerbose("[SERVIDOR] Serviço de relógio interno ouvindo em tcp://*:%d", clockPort)
 	for {
 		data, err := sock.RecvBytes(0)
 		if err != nil {
@@ -499,8 +1058,8 @@ func (s *Servidor) loopRelogio() {
 			resposta = s.processarPedidoRelogio(c.HeartbeatReq)
 		default:
 			resposta = &protos.HeartbeatResponse{
-				Status:   protos.Status_STATUS_ERRO,
-				ErroMsg:  fmt.Sprintf("tipo não suportado: %T", c),
+				Status:    protos.Status_STATUS_ERRO,
+				ErroMsg:   fmt.Sprintf("tipo não suportado: %T", c),
 				Cabecalho: nil,
 			}
 		}
@@ -517,7 +1076,7 @@ func (s *Servidor) loopRelogio() {
 func (s *Servidor) loopEleicao() {
 	sock := mustBindReplySocket(electionPort)
 	defer sock.Close()
-	log.Printf("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:%d", electionPort)
+	logVerbose("[SERVIDOR] Serviço de eleição interno ouvindo em tcp://*:%d", electionPort)
 	for {
 		data, err := sock.RecvBytes(0)
 		if err != nil {
@@ -557,11 +1116,28 @@ func (s *Servidor) loopEleicao() {
 }
 
 func (s *Servidor) loopAnunciosCoordenador() {
-	log.Printf("[SERVIDOR] Escutando anúncios de coordenador no tópico %s", topicoCoordenador)
+	logVerbose("[SERVIDOR] Escutando tópicos internos %s e %s", topicoCoordenador, topicoReplica)
 	for {
 		msg, err := s.subSock.RecvMessageBytes(0)
 		if err != nil || len(msg) < 2 {
 			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		topico := string(msg[0])
+		if topico == topicoReplica {
+			env, err := mensageria.EnvelopeFromBytes(msg[1])
+			if err != nil {
+				continue
+			}
+			if env.GetCabecalho().GetLinguagemOrigem() == s.replicaOrigem() {
+				continue
+			}
+			s.clock.OnReceive(env.GetCabecalho().GetRelogioLogico())
+			s.aplicarOperacaoReplicada(env)
+			logVerbose("[SERVIDOR] Operação replicada recebida: %s", conteudoNome(env))
+			continue
+		}
+		if topico != topicoCoordenador {
 			continue
 		}
 
@@ -574,8 +1150,14 @@ func (s *Servidor) loopAnunciosCoordenador() {
 		if coordenador == "" {
 			continue
 		}
-		s.setCoordenador(coordenador, fmt.Sprintf("anúncio publicado por %s", channelMsg.GetRemetente()), true)
-		log.Printf("[SERVIDOR] Anúncio de coordenador recebido em servers: %s", coordenador)
+		remetente := strings.TrimSpace(channelMsg.GetRemetente())
+		if remetente == s.serverName && coordenador == s.serverName {
+			continue
+		}
+		if remetente == "" {
+			remetente = "desconhecido"
+		}
+		s.processarAnuncioCoordenador(coordenador, remetente)
 	}
 }
 
@@ -605,6 +1187,9 @@ func (s *Servidor) resumoServidores(servidores []*protos.ServerInfo) string {
 
 func (s *Servidor) atualizarServidoresAtivos(servidores []*protos.ServerInfo) {
 	s.stateMu.Lock()
+	for _, servidor := range servidores {
+		s.knownRanks[servidor.GetNome()] = servidor.GetRank()
+	}
 	if len(servidores) > 0 {
 		s.activeServers = make(map[string]int32, len(servidores))
 		for _, servidor := range servidores {
@@ -615,10 +1200,28 @@ func (s *Servidor) atualizarServidoresAtivos(servidores []*protos.ServerInfo) {
 	}
 	if s.myRank > 0 {
 		s.activeServers[s.serverName] = s.myRank
+		s.knownRanks[s.serverName] = s.myRank
 	}
 	s.stateMu.Unlock()
 
-	log.Printf("[SERVIDOR] Lista ativa local atualizada: %s", s.resumoServidores(s.servidoresAtivosSnapshot()))
+	logVerbose("[SERVIDOR] Lista ativa local atualizada: %s", s.resumoServidores(s.servidoresAtivosSnapshot()))
+}
+
+func (s *Servidor) restaurarServidorAtivoLocal(nome string) {
+	s.stateMu.Lock()
+	rank, ok := s.activeServers[nome]
+	if !ok {
+		rank, ok = s.knownRanks[nome]
+	}
+	if !ok {
+		s.stateMu.Unlock()
+		logVerbose("[SERVIDOR] Coordenador %s respondeu ao teste direto, mas rank local e desconhecido", nome)
+		return
+	}
+	s.activeServers[nome] = rank
+	s.stateMu.Unlock()
+
+	logVerbose("[SERVIDOR] Coordenador %s respondeu ao teste direto; restaurado na lista ativa local rank=%d", nome, rank)
 }
 
 func (s *Servidor) maiorServidorAtivo() string {
@@ -635,35 +1238,30 @@ func (s *Servidor) coordenadorAtual() string {
 	return s.coordenador
 }
 
-func (s *Servidor) versaoCoordenador() int64 {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	return s.coordenadorVersao
-}
-
-func (s *Servidor) setCoordenador(nome, motivo string, incrementarVersao bool) {
+func (s *Servidor) setCoordenador(nome string) string {
 	s.stateMu.Lock()
 	anterior := s.coordenador
 	s.coordenador = nome
-	if incrementarVersao {
-		s.coordenadorVersao++
-	}
-	versao := s.coordenadorVersao
 	s.stateMu.Unlock()
-
-	if anterior == nome {
-		log.Printf("[SERVIDOR] Coordenador mantido em %s (%s, versao=%d)", nome, motivo, versao)
-	} else {
-		log.Printf("[SERVIDOR] Coordenador atualizado de %s para %s (%s, versao=%d)", anterior, nome, motivo, versao)
-	}
+	return anterior
 }
 
-func (s *Servidor) definirCoordenadorTentativo(servidores []*protos.ServerInfo) {
-	if s.coordenadorAtual() != "" {
+func (s *Servidor) avaliarEleicaoAposAtualizacao(motivo string) {
+	servidores := s.servidoresAtivosSnapshot()
+	if len(servidores) == 0 {
 		return
 	}
-	candidato := s.maiorServidorAtivo()
-	s.setCoordenador(candidato, "coordenador tentativo inicial", false)
+	maior := servidores[len(servidores)-1]
+	coordenador := s.coordenadorAtual()
+	var rankCoordenador int32 = -1
+	if coordenador != "" {
+		if rank, ok := s.rankServidor(coordenador); ok {
+			rankCoordenador = rank
+		}
+	}
+	if coordenador == "" || rankCoordenador < 0 || maior.GetRank() > rankCoordenador {
+		s.iniciarEleicaoAsync(motivo)
+	}
 }
 
 func (s *Servidor) isCoordenador() bool {
@@ -680,7 +1278,7 @@ func (s *Servidor) executarEleicao(motivo string) {
 	s.stateMu.Lock()
 	if s.electionRunning {
 		s.stateMu.Unlock()
-		log.Printf("[SERVIDOR] Eleição já em andamento; ignorando gatilho (%s)", motivo)
+		logVerbose("[SERVIDOR] Eleição já em andamento; ignorando gatilho (%s)", motivo)
 		return
 	}
 	s.electionRunning = true
@@ -691,8 +1289,8 @@ func (s *Servidor) executarEleicao(motivo string) {
 		s.stateMu.Unlock()
 	}()
 
-	log.Printf("[SERVIDOR] Iniciando eleição (%s)", motivo)
-	versaoInicial := s.versaoCoordenador()
+	logEleicao("inicio motivo=%s", motivo)
+	s.listarServidoresReferencia()
 	servidores := s.servidoresAtivosSnapshot()
 	superiores := make([]*protos.ServerInfo, 0, len(servidores))
 	for _, item := range servidores {
@@ -702,58 +1300,31 @@ func (s *Servidor) executarEleicao(motivo string) {
 	}
 
 	if len(superiores) == 0 {
-		if s.versaoCoordenador() > versaoInicial {
-			log.Printf("[SERVIDOR] Eleição concluída durante a coleta de respostas")
-			return
-		}
-		s.tornarCoordenador("nenhum servidor de maior rank respondeu")
+		s.tornarCoordenador("sem_servidor_maior")
 		return
 	}
 
-	respostasOk := make([]*protos.ServerInfo, 0, len(superiores))
+	recebeuOk := false
 	sort.Slice(superiores, func(i, j int) bool {
 		return superiores[i].GetRank() > superiores[j].GetRank()
 	})
 	for _, item := range superiores {
-		if s.consultarEleicaoServidor(item.GetNome()) {
-			respostasOk = append(respostasOk, item)
+		if s.consultarEleicaoServidor(item.GetNome(), true) {
+			recebeuOk = true
 		}
 	}
 
-	if s.versaoCoordenador() > versaoInicial {
-		log.Printf("[SERVIDOR] Eleição concluída por anúncio recebido durante a coleta")
+	if !recebeuOk {
+		s.tornarCoordenador("sem_resposta_de_servidor_maior")
 		return
 	}
 
-	if len(respostasOk) == 0 {
-		s.tornarCoordenador("nenhum servidor de maior rank respondeu")
-		return
-	}
-
-	deadline := time.Now().Add(announcementDelay)
-	for time.Now().Before(deadline) {
-		if s.versaoCoordenador() > versaoInicial {
-			log.Printf("[SERVIDOR] Eleição concluída por anúncio de coordenador")
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	candidato := respostasOk[0]
-	for _, item := range respostasOk[1:] {
-		if item.GetRank() > candidato.GetRank() {
-			candidato = item
-		}
-	}
-	s.setCoordenador(
-		candidato.GetNome(),
-		fmt.Sprintf("coordenador inferido após timeout de anúncio (%s)", motivo),
-		true,
-	)
+	logEleicao("delegada motivo=%s", motivo)
 }
 
 func (s *Servidor) tornarCoordenador(motivo string) {
-	s.setCoordenador(s.serverName, motivo, true)
+	s.setCoordenador(s.serverName)
+	logEleicao("eleito coordenador=%s rank=%d motivo=%s", s.serverName, s.myRank, motivo)
 	s.anunciarCoordenador()
 }
 
@@ -775,7 +1346,59 @@ func (s *Servidor) anunciarCoordenador() {
 		log.Printf("[SERVIDOR] Falha ao anunciar coordenador: %v", err)
 		return
 	}
-	log.Printf("[SERVIDOR] Anunciado coordenador em servers: %s", s.serverName)
+	logEleicao("anuncio publicado coordenador=%s rank=%d", s.serverName, s.myRank)
+}
+
+func (s *Servidor) processarAnuncioCoordenador(coordenador, remetente string) {
+	s.listarServidoresReferencia()
+	rankAnunciado, ok := s.rankServidor(coordenador)
+	if coordenador == s.serverName {
+		rankAnunciado = s.myRank
+		ok = true
+	}
+	if !ok {
+		logEleicaoVerbose("anuncio ignorado coordenador=%s rank=desconhecido motivo=servidor_desconhecido", coordenador)
+		return
+	}
+
+	atual := s.coordenadorAtual()
+	rankAtual, atualConhecido := s.rankServidor(atual)
+	aceitar := false
+	motivo := "sem_coordenador"
+	if atual == "" || atual == coordenador {
+		aceitar = true
+		if atual == coordenador {
+			motivo = "mesmo_coordenador"
+		}
+	} else if !atualConhecido {
+		aceitar = true
+		motivo = "coordenador_atual_desconhecido"
+	} else if rankAnunciado >= rankAtual {
+		aceitar = true
+		motivo = "rank_maior_ou_igual"
+	} else if atual != s.serverName && !s.consultarEleicaoServidor(atual, false) {
+		aceitar = true
+		motivo = "coordenador_atual_indisponivel"
+	}
+
+	if aceitar {
+		s.setCoordenador(coordenador)
+		logEleicao(
+			"anuncio aceito coordenador=%s rank=%d origem=%s motivo=%s",
+			coordenador,
+			rankAnunciado,
+			remetente,
+			motivo,
+		)
+		return
+	}
+
+	logEleicaoVerbose(
+		"anuncio ignorado coordenador=%s rank=%d motivo=rank_menor_que_atual atual=%s",
+		coordenador,
+		rankAnunciado,
+		atual,
+	)
 }
 
 func (s *Servidor) enviarParaServidor(nomeServidor string, porta int, env *protos.Envelope, timeout time.Duration) (*protos.Envelope, int64, int64, error) {
@@ -814,54 +1437,64 @@ func (s *Servidor) consultarRelogioServidor(nomeServidor string) *protos.Envelop
 		Cabecalho: cab,
 		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
 	}
-	log.Printf("[SERVIDOR] Enviando heartbeat_req para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
+	logVerbose("[SERVIDOR] Enviando heartbeat_req para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
 	resp, _, _, err := s.enviarParaServidor(nomeServidor, clockPort, env, requestTimeout)
 	if err != nil {
-		log.Printf("[SERVIDOR] Sem resposta de relógio de %s: %v", nomeServidor, err)
+		logVerbose("[SERVIDOR] Sem resposta de relógio de %s: %v", nomeServidor, err)
 		return nil
 	}
 
 	resposta, ok := resp.GetConteudo().(*protos.Envelope_HeartbeatRes)
 	if !ok {
-		log.Printf("[SERVIDOR] Resposta inesperada de relógio de %s: %T", nomeServidor, resp.GetConteudo())
+		logVerbose("[SERVIDOR] Resposta inesperada de relógio de %s: %T", nomeServidor, resp.GetConteudo())
 		return nil
 	}
 	if resposta.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[SERVIDOR] Servidor %s rejeitou pedido de relógio: %s", nomeServidor, resposta.HeartbeatRes.GetErroMsg())
+		logVerbose("[SERVIDOR] Servidor %s rejeitou pedido de relógio: %s", nomeServidor, resposta.HeartbeatRes.GetErroMsg())
 		return nil
 	}
-	log.Printf("[SERVIDOR] Recebido heartbeat_res de %s %s", nomeServidor, mensageria.CabecalhoTexto(resp.GetCabecalho()))
+	logVerbose("[SERVIDOR] Recebido heartbeat_res de %s %s", nomeServidor, mensageria.CabecalhoTexto(resp.GetCabecalho()))
 	return resp
 }
 
-func (s *Servidor) consultarEleicaoServidor(nomeServidor string) bool {
+func (s *Servidor) consultarEleicaoServidor(nomeServidor string, registrarLogs bool) bool {
 	cab := mensageria.NovoCabecalho(s.origem, s.clock)
 	req := &protos.RegisterServerRequest{Cabecalho: cab, NomeServidor: s.serverName}
 	env := &protos.Envelope{
 		Cabecalho: cab,
 		Conteudo:  &protos.Envelope_RegisterServerReq{RegisterServerReq: req},
 	}
-	log.Printf("[SERVIDOR] Enviando pedido de eleição para %s %s", nomeServidor, mensageria.CabecalhoTexto(cab))
+	if registrarLogs {
+		logEleicaoVerbose("req destino=%s", nomeServidor)
+	}
 	resp, _, _, err := s.enviarParaServidor(nomeServidor, electionPort, env, requestTimeout)
 	if err != nil {
-		log.Printf("[SERVIDOR] Sem resposta de eleição de %s: %v", nomeServidor, err)
+		if registrarLogs {
+			logEleicaoVerbose("sem_resposta destino=%s", nomeServidor)
+		}
 		return false
 	}
 
 	resposta, ok := resp.GetConteudo().(*protos.Envelope_RegisterServerRes)
 	if !ok {
-		log.Printf("[SERVIDOR] Resposta inesperada de eleição de %s: %T", nomeServidor, resp.GetConteudo())
+		if registrarLogs {
+			logEleicaoVerbose("resposta_invalida destino=%s", nomeServidor)
+		}
 		return false
 	}
 	if resposta.RegisterServerRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[SERVIDOR] Servidor %s rejeitou eleição: %s", nomeServidor, resposta.RegisterServerRes.GetErroMsg())
+		if registrarLogs {
+			logEleicaoVerbose("rejeitada destino=%s motivo=%s", nomeServidor, resposta.RegisterServerRes.GetErroMsg())
+		}
 		return false
 	}
-	log.Printf("[SERVIDOR] Servidor %s respondeu OK à eleição (rank=%d)", nomeServidor, resposta.RegisterServerRes.GetRank())
+	if registrarLogs {
+		logEleicaoVerbose("ok origem=%s rank=%d", nomeServidor, resposta.RegisterServerRes.GetRank())
+	}
 	return true
 }
 
-func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
+func (s *Servidor) sincronizarComoSeguidor(coordenador string, timeout time.Duration) bool {
 	if coordenador == "" {
 		return false
 	}
@@ -872,19 +1505,19 @@ func (s *Servidor) sincronizarComoSeguidor(coordenador string) bool {
 		Conteudo:  &protos.Envelope_HeartbeatReq{HeartbeatReq: req},
 	}
 
-	resp, envioNs, recebimentoNs, err := s.enviarParaServidor(coordenador, clockPort, env, requestTimeout)
+	resp, envioNs, recebimentoNs, err := s.enviarParaServidor(coordenador, clockPort, env, timeout)
 	if err != nil {
-		log.Printf("[SERVIDOR] Falha ao sincronizar com coordenador %s: %v", coordenador, err)
+		logVerbose("[SERVIDOR] Falha ao sincronizar com coordenador %s: %v", coordenador, err)
 		return false
 	}
 	resposta, ok := resp.GetConteudo().(*protos.Envelope_HeartbeatRes)
 	if !ok || resposta.HeartbeatRes.GetStatus() != protos.Status_STATUS_SUCESSO {
-		log.Printf("[SERVIDOR] Coordenador %s rejeitou sincronização", coordenador)
+		logVerbose("[SERVIDOR] Coordenador %s rejeitou sincronização", coordenador)
 		return false
 	}
 
 	s.clock.AtualizarOffset(resp.GetCabecalho().GetTimestampEnvio(), envioNs, recebimentoNs)
-	log.Printf("[SERVIDOR] Offset físico atualizado para %.3f ms usando coordenador %s", s.clock.OffsetMillis(), coordenador)
+	logVerbose("[SERVIDOR] Offset físico atualizado para %.3f ms usando coordenador %s", s.clock.OffsetMillis(), coordenador)
 	return true
 }
 
@@ -919,7 +1552,7 @@ func (s *Servidor) sincronizarComoCoordenador() {
 	mediaNs /= int64(len(amostras))
 	agoraNs := time.Now().UnixNano()
 	s.clock.AtualizarOffset(timestamppb.New(time.Unix(0, mediaNs).UTC()), agoraNs, agoraNs)
-	log.Printf(
+	logVerbose(
 		"[SERVIDOR] Berkeley aplicado pelo coordenador %s com participantes=%s falhas=%s media=%s offset=%.3f ms",
 		s.serverName,
 		strings.Join(participantes, ", "),
@@ -932,9 +1565,8 @@ func (s *Servidor) sincronizarComoCoordenador() {
 func (s *Servidor) sincronizarRelogioFisico() {
 	coordenador := s.coordenadorAtual()
 	if coordenador == "" {
-		log.Printf("[SERVIDOR] Coordenador desconhecido; iniciando eleição")
-		s.executarEleicao("coordenador desconhecido")
-		coordenador = s.coordenadorAtual()
+		s.iniciarEleicaoAsync("coordenador_desconhecido")
+		return
 	}
 
 	if s.isCoordenador() {
@@ -947,29 +1579,24 @@ func (s *Servidor) sincronizarRelogioFisico() {
 		ativos[servidor.GetNome()] = true
 	}
 	if coordenador != "" && !ativos[coordenador] {
-		log.Printf("[SERVIDOR] Coordenador %s ausente da lista ativa; iniciando eleição", coordenador)
-		s.executarEleicao("coordenador ausente da lista ativa")
-		coordenador = s.coordenadorAtual()
-		if s.isCoordenador() {
-			s.sincronizarComoCoordenador()
+		logVerbose(
+			"[SERVIDOR] Coordenador %s ausente da lista da referencia; testando diretamente com timeout=%dms",
+			coordenador,
+			timeoutTesteCoordenador.Milliseconds(),
+		)
+		if s.sincronizarComoSeguidor(coordenador, timeoutTesteCoordenador) {
+			s.restaurarServidorAtivoLocal(coordenador)
 			return
 		}
-	}
-
-	if coordenador != "" && s.sincronizarComoSeguidor(coordenador) {
+		s.iniciarEleicaoAsync("coordenador_indisponivel_apos_teste")
 		return
 	}
 
-	log.Printf("[SERVIDOR] Falha ao sincronizar com coordenador %s; iniciando eleição", coordenador)
-	s.executarEleicao("falha ao sincronizar com coordenador")
-	coordenador = s.coordenadorAtual()
-	if s.isCoordenador() {
-		s.sincronizarComoCoordenador()
+	if coordenador != "" && s.sincronizarComoSeguidor(coordenador, requestTimeout) {
 		return
 	}
-	if coordenador != "" && !s.sincronizarComoSeguidor(coordenador) {
-		log.Printf("[SERVIDOR] Ainda não foi possível sincronizar com %s após a eleição", coordenador)
-	}
+
+	s.iniciarEleicaoAsync(fmt.Sprintf("falha_sincronizar_com_%s", coordenador))
 }
 
 func (s *Servidor) processarPedidoRelogio(req *protos.HeartbeatRequest) *protos.HeartbeatResponse {
@@ -982,19 +1609,19 @@ func (s *Servidor) processarPedidoRelogio(req *protos.HeartbeatRequest) *protos.
 	coordenador := s.coordenadorAtual()
 	if s.isCoordenador() {
 		resposta.Status = protos.Status_STATUS_SUCESSO
-		log.Printf("[SERVIDOR] Respondendo relógio ao servidor %s como coordenador", solicitante)
+		logVerbose("[SERVIDOR] Respondendo relógio ao servidor %s como coordenador", solicitante)
 		return resposta
 	}
 
 	if solicitante == coordenador && coordenador != "" {
 		resposta.Status = protos.Status_STATUS_SUCESSO
-		log.Printf("[SERVIDOR] Respondendo relógio ao coordenador %s", solicitante)
+		logVerbose("[SERVIDOR] Respondendo relógio ao coordenador %s", solicitante)
 		return resposta
 	}
 
 	resposta.Status = protos.Status_STATUS_ERRO
 	resposta.ErroMsg = "nao sou coordenador"
-	log.Printf("[SERVIDOR] Pedido de relógio de %s rejeitado; coordenador atual=%s", solicitante, coordenador)
+	logVerbose("[SERVIDOR] Pedido de relógio de %s rejeitado; coordenador atual=%s", solicitante, coordenador)
 	return resposta
 }
 
@@ -1013,8 +1640,10 @@ func (s *Servidor) processarPedidoEleicao(req *protos.RegisterServerRequest) *pr
 	if s.myRank > rankSolicitante {
 		resposta.Status = protos.Status_STATUS_SUCESSO
 		resposta.Rank = s.myRank
-		log.Printf("[SERVIDOR] Respondendo eleição OK para %s (solicitante rank=%d, meu rank=%d)", solicitante, rankSolicitante, s.myRank)
-		if !s.isCoordenador() {
+		logEleicaoVerbose("ok enviado destino=%s rank=%d solicitante_rank=%d", solicitante, s.myRank, rankSolicitante)
+		if s.isCoordenador() {
+			s.anunciarCoordenador()
+		} else {
 			s.iniciarEleicaoAsync(fmt.Sprintf("pedido de eleição recebido de %s", solicitante))
 		}
 		return resposta
@@ -1023,7 +1652,7 @@ func (s *Servidor) processarPedidoEleicao(req *protos.RegisterServerRequest) *pr
 	resposta.Status = protos.Status_STATUS_ERRO
 	resposta.ErroMsg = "rank inferior"
 	resposta.Rank = s.myRank
-	log.Printf("[SERVIDOR] Pedido de eleição de %s rejeitado (solicitante rank=%d, meu rank=%d)", solicitante, rankSolicitante, s.myRank)
+	logEleicaoVerbose("pedido ignorado origem=%s motivo=rank_inferior solicitante_rank=%d meu_rank=%d", solicitante, rankSolicitante, s.myRank)
 	return resposta
 }
 
@@ -1031,6 +1660,10 @@ func (s *Servidor) rankServidor(nome string) (int32, bool) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	rank, ok := s.activeServers[nome]
+	if ok {
+		return rank, true
+	}
+	rank, ok = s.knownRanks[nome]
 	return rank, ok
 }
 
@@ -1043,6 +1676,7 @@ func (s *Servidor) processarLogin(req *protos.LoginRequest) *protos.LoginRespons
 		return res
 	}
 	s.registrarLogin(nome, mensageria.TimestampTexto(req.GetCabecalho().GetTimestampEnvio()))
+	s.replicarLogin(req)
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res
 }
@@ -1055,16 +1689,12 @@ func (s *Servidor) processarCreateChannel(req *protos.CreateChannelRequest) *pro
 		res.ErroMsg = "nome de canal vazio"
 		return res
 	}
-	canais := s.lerCanais()
-	for _, c := range canais {
-		if c == nome {
-			res.Status = protos.Status_STATUS_ERRO
-			res.ErroMsg = "canal já existe"
-			return res
-		}
+	if !s.adicionarCanalIdempotente(nome) {
+		res.Status = protos.Status_STATUS_ERRO
+		res.ErroMsg = "canal já existe"
+		return res
 	}
-	canais = append(canais, nome)
-	s.salvarCanais(canais)
+	s.replicarCreateChannel(req)
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res
 }
@@ -1125,7 +1755,7 @@ func (s *Servidor) processarPublish(
 		res.ErroMsg = "erro ao serializar publicacao"
 		return res
 	}
-	log.Printf(
+	logVerbose(
 		"[SERVIDOR] Publicando em %s ts=%s relogio=%d",
 		canal,
 		mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()),
@@ -1138,6 +1768,7 @@ func (s *Servidor) processarPublish(
 	}
 
 	s.registrarPublicacao(canal, mensagem, remetente, mensageria.TimestampTexto(channelMsg.GetTimestampEnvio()))
+	s.replicarPublicacao(canal, mensagem, remetente, cabPub)
 
 	res.Status = protos.Status_STATUS_SUCESSO
 	return res

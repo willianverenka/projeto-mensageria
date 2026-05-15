@@ -7,6 +7,9 @@ namespace Cliente;
 
 public class ClienteApp
 {
+    private static readonly string LogMode =
+        (Environment.GetEnvironmentVariable("CLIENT_LOG_MODE") ?? "presentation").Trim().ToLowerInvariant();
+
     private readonly string _orqEndpoint;
     private readonly string _proxySubEndpoint;
     private readonly string _nomeUsuario;
@@ -30,18 +33,26 @@ public class ClienteApp
         _socket.Connect(_orqEndpoint);
         _subSocket = new SubscriberSocket();
         _subSocket.Connect(_proxySubEndpoint);
-        Console.WriteLine($"[CLIENTE] Conectado ao orquestrador em {_orqEndpoint}");
-        Console.WriteLine($"[CLIENTE] Conectado ao proxy sub em {_proxySubEndpoint}");
+        LogVerbose($"[CLIENTE] Conectado ao orquestrador em {_orqEndpoint}");
+        LogVerbose($"[CLIENTE] Conectado ao proxy sub em {_proxySubEndpoint}");
+    }
+
+    private static bool IsVerbose() => LogMode == "verbose";
+
+    private static void LogVerbose(string message)
+    {
+        if (IsVerbose())
+            Console.WriteLine(message);
     }
 
     private Envelope EnviarEAguardar(Envelope env)
     {
-        Console.WriteLine($"[CLIENTE] Enviando {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
+        LogVerbose($"[CLIENTE] Enviando {env.ConteudoCase} {Mensageria.CabecalhoTexto(env.Cabecalho)}");
         _socket.SendFrame(Mensageria.EnvelopeBytes(env));
         var data = _socket.ReceiveFrameBytes();
         var resp = Mensageria.EnvelopeFromBytes(data);
         _relogio.OnReceive(resp.Cabecalho.RelogioLogico);
-        Console.WriteLine($"[CLIENTE] Recebido {resp.ConteudoCase} {Mensageria.CabecalhoTexto(resp.Cabecalho)}");
+        LogVerbose($"[CLIENTE] Recebido {resp.ConteudoCase} {Mensageria.CabecalhoTexto(resp.Cabecalho)}");
         return resp;
     }
 
@@ -62,17 +73,17 @@ public class ClienteApp
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.LoginRes)
         {
-            Console.WriteLine($"[CLIENTE] Resposta inesperada ao login: {resp.ConteudoCase}");
+            LogVerbose($"[CLIENTE] Resposta inesperada ao login: {resp.ConteudoCase}");
             return false;
         }
 
         if (resp.LoginRes.Status == Status.Sucesso)
         {
-            Console.WriteLine($"[CLIENTE] Login bem-sucedido para '{nomeUsuario}'");
+            LogVerbose($"[CLIENTE] Login bem-sucedido para '{nomeUsuario}'");
             return true;
         }
 
-        Console.WriteLine($"[CLIENTE] Falha no login: {resp.LoginRes.ErroMsg}");
+        LogVerbose($"[CLIENTE] Falha no login: {resp.LoginRes.ErroMsg}");
         return false;
     }
 
@@ -93,14 +104,14 @@ public class ClienteApp
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.CreateChannelRes)
         {
-            Console.WriteLine($"[CLIENTE] Resposta inesperada a criação de canal: {resp.ConteudoCase}");
+            LogVerbose($"[CLIENTE] Resposta inesperada a criação de canal: {resp.ConteudoCase}");
             return;
         }
 
         if (resp.CreateChannelRes.Status == Status.Sucesso)
-            Console.WriteLine($"[CLIENTE] Canal '{nomeCanal}' criado com sucesso");
+            LogVerbose($"[CLIENTE] Canal '{nomeCanal}' criado com sucesso");
         else
-            Console.WriteLine($"[CLIENTE] Falha ao criar canal '{nomeCanal}': {resp.CreateChannelRes.ErroMsg}");
+            LogVerbose($"[CLIENTE] Falha ao criar canal '{nomeCanal}': {resp.CreateChannelRes.ErroMsg}");
     }
 
     public List<string> ListarCanais()
@@ -119,13 +130,13 @@ public class ClienteApp
 
         if (resp.ConteudoCase != Envelope.ConteudoOneofCase.ListChannelsRes)
         {
-            Console.WriteLine($"[CLIENTE] Resposta inesperada a listagem de canais: {resp.ConteudoCase}");
+            LogVerbose($"[CLIENTE] Resposta inesperada a listagem de canais: {resp.ConteudoCase}");
             return [];
         }
 
         var canais = resp.ListChannelsRes.Canais.ToList();
         var lista = canais.Any() ? string.Join(", ", canais) : "(nenhum)";
-        Console.WriteLine($"[CLIENTE] Canais existentes: {lista}");
+        LogVerbose($"[CLIENTE] Canais existentes: {lista}");
         return canais;
     }
 
@@ -154,7 +165,7 @@ public class ClienteApp
             return;
         _subSocket.Subscribe(canal);
         _inscricoes.Add(canal);
-        Console.WriteLine($"[CLIENTE] Inscrito no canal '{canal}'");
+        LogVerbose($"[CLIENTE] Inscrito no canal '{canal}'");
     }
 
     public void IniciarReceptor()
@@ -169,7 +180,7 @@ public class ClienteApp
                     var payload = _subSocket.ReceiveFrameBytes();
                     var msg = ChannelMessage.Parser.ParseFrom(payload);
                     _relogio.OnReceive(msg.RelogioLogico);
-                    Console.WriteLine(
+                    LogVerbose(
                         $"[CLIENTE] [CANAL={topic}] msg='{msg.Mensagem}' remetente={msg.Remetente} envio={Mensageria.TimestampTexto(msg.TimestampEnvio)} recebimento={Mensageria.TimestampTexto(Mensageria.TimestampFromNs(Mensageria.AgoraNs()))} relogio={msg.RelogioLogico}"
                     );
                 }
